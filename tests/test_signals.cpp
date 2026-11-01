@@ -6,6 +6,9 @@
 #include <cstdio>
 
 #include "signals/signals.hpp"
+#include "itch/parser.hpp"
+#include "signals/signal_engine.hpp"
+#include "wire.hpp"
 
 namespace {
 
@@ -77,12 +80,58 @@ void test_signed_volume_and_decay() {
     CHECK(near(s.at(1'500'000'000, tau), s.at(2'000'000'000, tau)));  // never decays backwards
 }
 
+void test_engine_bbo_changes_and_ofi() {
+    signals::SignalEngine e(1e9);
+    const std::uint16_t loc = 3;
+    CHECK(e.update_bbo(loc, 100, quote(10'000, 300, 0, 0)));     // one-sided: no OFI yet
+    CHECK(e.update_bbo(loc, 200, quote(10'000, 300, 10'002, 200)));  // prev one-sided: no OFI
+    CHECK(!e.update_bbo(loc, 300, quote(10'000, 300, 10'002, 200)));  // unchanged touch
+    CHECK(e.update_bbo(loc, 400, quote(10'000, 400, 10'002, 200)));   // OFI +100
+    CHECK(e.bbo_changes(loc) == 3);
+    CHECK(e.bbo(loc) == quote(10'000, 400, 10'002, 200));
+    const signals::Snapshot s = e.snapshot(loc, 400);
+    CHECK(near(s.ofi, 100));
+    CHECK(near(s.imbalance, (400.0 - 200) / 600));
+    const double m = 10'001;
+    CHECK(near(s.micro_bps, (signals::microprice(quote(10'000, 400, 10'002, 200)) - m) / m * 1e4));
+    CHECK(near(e.snapshot(loc, 400 + 1'000'000'000).ofi, 100 * std::exp(-1.0), 1e-9));
+    CHECK(e.last_ts() == 400);
+}
+
+void test_engine_trade_flow() {
+    signals::SignalEngine e(1e9);
+    e.on_execution(5, 1'000, 'B', 100, 10'000);  // sell-initiated
+    e.on_execution(5, 1'000, 'S', 30, 10'002);   // buy-initiated
+    CHECK(near(e.snapshot(5, 1'000).flow, -70));
+    CHECK(e.executions(5) == 2);
+    CHECK(near(e.snapshot(6, 1'000).flow, 0));  // other symbols untouched
+}
+
+void test_engine_as_book_listener() {
+    test::Wire w;
+    w.header('A', 9, 0, 100).be(1, 8).ch('B').be(100, 4).str("TEST", 8).be(10'000, 4).end();
+    w.header('A', 9, 0, 200).be(2, 8).ch('S').be(100, 4).str("TEST", 8).be(10'002, 4).end();
+    w.header('A', 9, 0, 300).be(3, 8).ch('B').be(50, 4).str("TEST", 8).be(9'990, 4).end();   // behind: no touch change
+    w.header('E', 9, 0, 400).be(2, 8).be(40, 4).be(1, 8).end();                               // buy-initiated 40
+    book::BookBuilder<book::VectorLevels, signals::SignalEngine> b(4);
+    itch::parse(w.data(), w.data_end(), b);
+    const signals::SignalEngine& e = b.listener();
+    CHECK(e.bbo(9) == b.book(9).bbo());
+    CHECK(e.bbo_changes(9) == 3);  // add bid, add ask, ask size 100 -> 60
+    CHECK(e.executions(9) == 1);
+    CHECK(near(e.snapshot(9, 400).flow, 40));
+    CHECK(near(e.snapshot(9, 400).ofi, 40));  // ask size down at the same price: +100 - 60
+}
+
 }  // namespace
 
 int main() {
     test_imbalance_mid_microprice();
     test_ofi_cases();
     test_signed_volume_and_decay();
+    test_engine_bbo_changes_and_ofi();
+    test_engine_trade_flow();
+    test_engine_as_book_listener();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;
