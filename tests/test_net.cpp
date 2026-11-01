@@ -4,9 +4,8 @@
 
 #include <cstdint>
 #include <cstdio>
-#include <initializer_list>
-
 #include <cstring>
+#include <initializer_list>
 #include <string_view>
 #include <vector>
 
@@ -62,6 +61,13 @@ void test_histogram_bucket_bounds() {
         }
         prev = i;
     }
+    for (std::size_t i = 0; i < H::kBuckets; ++i) {
+        const bool lo_ok = H::index(H::lower_bound(i)) == i;
+        const bool hi_ok = i + 1 >= H::kBuckets || H::index(H::upper_bound(i)) == i;
+        CHECK(lo_ok);
+        CHECK(hi_ok);
+        if (!lo_ok || !hi_ok) return;
+    }
 }
 
 void test_histogram_tail() {
@@ -69,10 +75,10 @@ void test_histogram_tail() {
     for (int i = 0; i < 990; ++i) h.record(10'000);   // 10 us body
     for (int i = 0; i < 10; ++i) h.record(5'000'000); // 5 ms tail
     const std::uint64_t p50 = h.percentile(0.5);
-    CHECK(p50 <= 10'000 && p50 >= 10'000 - 10'000 / 128);
-    CHECK(h.percentile(0.95) <= 10'000);
+    CHECK(p50 >= 10'000 && p50 <= 10'000 + 10'000 / 128);
+    CHECK(h.percentile(0.95) <= 10'000 + 10'000 / 128);
     const std::uint64_t p999 = h.percentile(0.999);
-    CHECK(p999 <= 5'000'000 && p999 >= 5'000'000 - 5'000'000 / 128);
+    CHECK(p999 == 5'000'000);
     CHECK(h.max() == 5'000'000);
     CHECK(stats::Histogram{}.percentile(0.5) == 0);
 }
