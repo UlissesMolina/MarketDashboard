@@ -3,10 +3,10 @@
 // Sequence-number bookkeeping for one MoldUDP64 session, without recovery: a
 // gap is counted and its messages are lost, so the books downstream can no
 // longer be trusted (their unknown-ref counter usually shows it too).
-// The first session name seen is locked in; other sessions are ignored.
+// The session locks on the first header seen, whatever it is; other sessions
+// are ignored.
 // SeqStats counts by header: the FeedHandler counts payloads that do not match
-// the header as malformed, which fails the run. The session locks on the first
-// header seen, whatever it is.
+// the header as malformed, which fails the run.
 
 #include <cstdint>
 #include <string>

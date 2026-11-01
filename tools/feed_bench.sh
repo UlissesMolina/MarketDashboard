@@ -8,6 +8,8 @@
 # as --iface; default 127.0.0.1, which keeps the feed on the host. 0.0.0.0 lets
 # the routing table pick, which on WSL also puts it onto the Hyper-V vSwitch via
 # eth0). An --iface in CONSUMER_ARGS or the replayer args overrides IFACE.
+# If the replayer args contain --from X and CONSUMER_ARGS has no --from, the
+# consumer gets --from X too, so it measures only the paced part of the replay.
 # Exits with the consumer's status, or the replayer's if the consumer succeeded.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -18,10 +20,21 @@ if [[ $# -lt 1 ]]; then
 fi
 file=$1
 shift
+consumer_args=${CONSUMER_ARGS:-}
+if [[ " $consumer_args " != *" --from "* ]]; then
+    prev=
+    for a in "$@"; do
+        if [[ $prev == --from ]]; then
+            consumer_args+=" --from $a"
+            break
+        fi
+        prev=$a
+    done
+fi
 iface=${IFACE:-127.0.0.1}
 out=$(mktemp)
 # shellcheck disable=SC2086  # CONSUMER_ARGS is meant to split into flags
-./build/feed_consumer --cpu "${CONSUMER_CPU:-2}" --iface "$iface" ${CONSUMER_ARGS:-} >"$out" 2>&1 &
+./build/feed_consumer --cpu "${CONSUMER_CPU:-2}" --iface "$iface" $consumer_args >"$out" 2>&1 &
 consumer=$!
 trap 'kill "$consumer" 2>/dev/null; rm -f "$out"' EXIT
 

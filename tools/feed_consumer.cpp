@@ -14,8 +14,9 @@
 //           recvmmsg() returned and the previous packet in the batch finishing
 //           (parse + book updates for this packet alone, no head-of-line wait)
 // Only packets whose first message is at or after --from are measured. Samples
-// where the realtime clock visibly stepped (backwards, or total > 1 s) are
-// counted as clock steps and left out.
+// where the realtime clock visibly stepped (backwards, or total > 10 s) are
+// counted as clock steps and left out. The forward cutoff is 10 s: a 256 MB
+// receive buffer can legitimately hold a backlog of more than 1 s.
 // Exits 1 if no datagram arrives within --start-timeout of joining (default
 // 30 s); after the first one, --idle-timeout (default 5 s) of silence ends the
 // run. Exits nonzero on any gap, malformed or truncated packet, packet without a
@@ -133,9 +134,10 @@ int run(int argc, char** argv) {
             if (!first_rx) first_rx = rx_ns;
             last_rx = rx_ns;
             if (r.first_ts < from) continue;
-            // Realtime clock stepped (WSL time sync): backwards, or forwards by more than 1 s.
+            // Realtime clock stepped (WSL time sync): backwards, or forwards by more than 10 s (a deep
+            // receive buffer can legitimately hold a >1 s backlog).
             // svc_start >= t_recv, so t_done < svc_start also covers t_done < t_recv.
-            if (t_recv < rx_ns || t_done < svc_start || t_done - rx_ns > 1'000'000'000) {
+            if (t_recv < rx_ns || t_done < svc_start || t_done - rx_ns > 10'000'000'000) {
                 ++clock_anomalies;
                 continue;
             }
