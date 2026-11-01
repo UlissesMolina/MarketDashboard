@@ -55,6 +55,14 @@ int main() {
     }
     CHECK(got == 3);
     CHECK(stamped);
+
+    const unsigned char big[4] = {'b', 'i', 'g', 0};
+    CHECK(::send(tx.fd(), big, sizeof big, 0) == 4);
+    net::RecvBatch<1, 3> small;
+    int small_got = 0;
+    const std::uint64_t deadline2 = net::monotonic_ns() + 1'000'000'000;
+    while (small_got < 1 && net::monotonic_ns() < deadline2) small_got = small.receive(rx.fd());
+    CHECK(small_got == 1 && small.truncated(0));
     std::printf("loopback multicast: %d/3 datagrams, rcvbuf granted %d bytes\n", got, granted);
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

@@ -9,6 +9,7 @@
 
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -54,11 +55,14 @@ public:
     [[nodiscard]] const unsigned char* end() const noexcept { return data_ + size_; }
     [[nodiscard]] std::size_t size() const noexcept { return size_; }
 
-    // Touch every page so later passes measure parsing, not page faults / disk.
-    // Returns a value derived from the bytes so the loop cannot be optimised out.
+    // Touch every page so later passes measure parsing,
+    // not page faults / disk. The empty asm consumes the sum, so the loop stays
+    // even when the caller ignores the result (as an inline function it would
+    // otherwise be deleted at -O3). Returns the sum of the touched bytes.
     unsigned prefault() const noexcept {
         unsigned acc = 0;
         for (std::size_t i = 0; i < size_; i += 4096) acc += data_[i];
+        asm volatile("" : : "r"(acc));
         return acc;
     }
 

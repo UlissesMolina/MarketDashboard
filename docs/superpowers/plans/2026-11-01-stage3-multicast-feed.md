@@ -1712,6 +1712,10 @@ git commit -m "Add multicast feed consumer with tick-to-book latency histograms"
 
 No code unless a run exposes a bug. If one does, switch to superpowers:systematic-debugging and add a failing unit test to `tests/test_net.cpp` before fixing it.
 
+- [ ] **Step 0: Check the receive buffer**
+
+Run any short bench (for example `--limit 1000`) and look at the consumer's `joined` line. If it says "capped by net.core.rmem_max", stop and ask the user to run `wsl -u root sysctl -w net.core.rmem_max=268435456`, then rerun the check. Do not take measurements with a capped buffer.
+
 - [ ] **Step 1: Full-file correctness run**
 
 Warm the page cache, then replay the whole day:
@@ -1726,14 +1730,16 @@ For each `R` in `1e6 2e6 5e6 10e6 0` (0 = unlimited), run:
 ```
 wsl -e bash -lc 'cd /mnt/c/market && bash tools/feed_bench.sh ~/itch/01302019.NASDAQ_ITCH50 --rate R --limit 50000000'
 ```
-Record for each run: the achieved M msgs/s, total p50/p99/p99.9/max, queue p99, and kernel drops/gaps. A nonzero exit is expected once drops start. That is the saturation point and belongs in the results. (`--limit` stops early, so the hash will not match the full-day value. That is expected.)
+Record for each run: the achieved M msgs/s, total p50/p99/p99.9/max, queue p99, and kernel drops/gaps. Rows where the sender itself is rate-limited or saturated report nonzero `rate-limited` counts on the replayer's `send lateness us` line; record those too, so a saturated sender is not mistaken for a consumer limit. A nonzero exit is expected once drops start. That is the saturation point and belongs in the results. (`--limit` stops early, so the hash will not match the full-day value. That is expected.)
 
 - [ ] **Step 3: Real-time market open**
 
+Run the open twice, once per batching window:
 ```
-wsl -e bash -lc 'cd /mnt/c/market && CONSUMER_ARGS="--from 09:29:30" bash tools/feed_bench.sh ~/itch/01302019.NASDAQ_ITCH50 --speed 1 --from 09:29:30 --to 09:35:00'
+wsl -e bash -lc 'cd /mnt/c/market && bash tools/feed_bench.sh ~/itch/01302019.NASDAQ_ITCH50 --speed 1 --from 09:29:30 --to 09:35:00 --batch-ns 0'
+wsl -e bash -lc 'cd /mnt/c/market && bash tools/feed_bench.sh ~/itch/01302019.NASDAQ_ITCH50 --speed 1 --from 09:29:30 --to 09:35:00 --batch-ns 10000'
 ```
-Takes about 6 minutes: catch-up at 5M/s, then 5.5 minutes in real time. Record the total/queue/book lines and the replayer's `max behind sched`. If the replayer fell more than a few µs behind schedule, the sender, not the consumer, shaped the bursts. Note that next to the results. Optionally repeat with `--speed 10` to show how latency grows as bursts are compressed.
+`--from` now propagates to the consumer automatically, so no `CONSUMER_ARGS` is needed. Each takes about 6 minutes: catch-up at 5M/s, then 5.5 minutes in real time. Record the total/queue/book/svc lines and the replayer's whole `send lateness us` line (including re-bases and rate-limited). The 10 us run is the headline, because there the sender holds its schedule. The `--batch-ns 0` run is the sender-bound worst case; report it with its re-base count. If the sender fell behind (re-bases, high lateness), say so next to those results.
 
 - [ ] **Step 4: Save raw output**
 
@@ -1781,14 +1787,16 @@ Add these bullets after the stage 2 design notes:
 - **Tick-to-book is measured from the kernel receive timestamp** (`SO_TIMESTAMPNS`). That is the closest software stand-in for a NIC hardware timestamp, and it is split into socket-queue time and parse+book time.
 - **Losses are counted, never repaired.** Sequence gaps, the kernel's own drop counter (`SO_RXQ_OVFL`), malformed packets, and book invariants are all reported. Any of them fails the run. Recovery (a Mold request server) is out of scope.
 - **Socket-free core.** `FeedHandler` holds all per-packet logic. Unit tests drive it with dropped, duplicated and overlapping packets and compare the resulting top-of-book hash to a direct parse.
-- **Pacing.** `--rate` caps average throughput. `--speed` replays real timestamps, so market-open bursts keep their shape.
+- **Pacing.** A token bucket enforces `--rate` for catch-up and rate mode, with a `--max-burst-us` bound on how much the sender may catch up after a stall. With `--speed`, paced packets follow the ITCH timestamps only (bundled within `--batch-ns`), and the schedule re-bases after a packet is 1 ms late, so later bursts keep their real spacing.
+- **Losses and clock steps.** Mold sequence gaps, including the end-of-session tail check, fail the run. The kernel drop counter is reported, but it is a lagging snapshot. Latency samples where the clock stepped are excluded and counted.
+- **Caveat on Stage 2 timings.** The prefault fix means the `book_replay` timings in the README may have included page faults, since prefault was optimized away before. This is noted, not re-measured.
 
 - [ ] **Step 3: Add results**
 
 Under Results, add a "### Multicast feed" subsection with the data from Task 9:
 1. Full-day run: messages, rate, gaps/drops, and the top-of-book hash (it should read `fea88aae34305502`, matching `book_replay`).
 2. A rate-sweep table with columns `Replay rate | Achieved | total p50 | p99 | p99.9 | max | queue p99 | drops`, one row per rate from Task 9 Step 2.
-3. The real-time 09:29:30–09:35:00 result: the three histogram lines and `max behind sched`.
+3. The real-time 09:29:30–09:35:00 result: the histogram lines for both `--batch-ns` runs and the replayer's whole `send lateness us` line (re-bases, rate-limited).
 4. Caveats: WSL2 is a VM, kernel UDP on loopback (no NIC), sender and receiver share the machine, realtime clock, and whether `rmem_max` was raised.
 
 - [ ] **Step 4: Commit**

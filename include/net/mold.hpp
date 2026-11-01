@@ -70,8 +70,8 @@ struct Span {
 
 // Takes whole message blocks from [p, end) for one packet: as many as fit in
 // max_payload bytes, at most max_count, and only while each message's timestamp
-// is within max_span_ns of the first one. A paced replay passes 0 so it never
-// holds a message back to batch it with a later event. Always takes one message
+// is within max_span_ns of the first one. A paced replay passes its --batch-ns
+// window (default 0) so bursts are not held back for later events. Takes one message
 // if a complete one is available. Returns count == 0 at end of input or when the
 // framing at p is truncated.
 [[nodiscard]] inline Span next_span(const unsigned char* p, const unsigned char* end, std::size_t max_payload,

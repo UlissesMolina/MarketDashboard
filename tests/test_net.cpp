@@ -36,7 +36,7 @@ void add(Wire& w, std::uint64_t ref, char side, std::uint32_t price, std::uint64
     w.header('A', kLoc, 0, ts).be(ref, 8).ch(side).be(100, 4).str("TEST", 8).be(price, 4).end();
 }
 
-void test_histogram_exact_below_128() {
+void test_histogram_exact_below_256() {
     stats::Histogram h;
     for (std::uint64_t v = 1; v <= 100; ++v) h.record(v);
     CHECK(h.count() == 100);
@@ -54,6 +54,13 @@ void test_histogram_bucket_bounds() {
         const std::uint64_t lo = H::lower_bound(H::index(v));
         CHECK(lo <= v);
         CHECK(v - lo <= v / 128);  // relative error below 1/128
+        const std::uint64_t hi = H::upper_bound(H::index(v));
+        if (v == ~0ULL) {
+            CHECK(hi == ~0ULL);
+        } else {
+            CHECK(hi >= v);
+            CHECK(hi - v <= v / 128);
+        }
     }
     CHECK(H::index(~0ULL) == H::kBuckets - 1);
     std::size_t prev = 0;
@@ -72,6 +79,16 @@ void test_histogram_bucket_bounds() {
         CHECK(hi_ok);
         if (!lo_ok || !hi_ok) return;
     }
+}
+
+void test_histogram_percentile_is_upper_bound() {
+    using H = stats::Histogram;
+    H h;
+    h.record(10'000);  // not a bucket boundary: its bucket is 64 wide
+    h.record(20'000);
+    const std::uint64_t ub = H::upper_bound(H::index(10'000));
+    CHECK(h.percentile(0.5) == ub);
+    CHECK(ub > 10'000);
 }
 
 void test_histogram_tail() {
@@ -194,6 +211,13 @@ void test_seq_heartbeat_end_and_session() {
     CHECK(t.ended() && t.stats().gaps == 1);
 }
 
+void test_seq_end_reveals_tail_gap() {
+    net::SeqTracker t;
+    on(t, 1, 2);
+    on(t, 7, net::kEndOfSession);  // expected 3: 3..6 lost
+    CHECK(t.stats().gaps == 1 && t.stats().lost_messages == 4 && t.ended());
+}
+
 using Book = book::BookBuilder<book::VectorLevels>;
 using Packet = std::vector<unsigned char>;
 
@@ -296,6 +320,19 @@ void test_feed_partial_overlap() {
     CHECK(b.tob_hash() == reference_hash(w));
 }
 
+void test_feed_skip_failure_is_malformed() {
+    Wire w;
+    add(w, 1, 'B', 100, 1);
+    add(w, 2, 'B', 100, 2);
+    Book b(8);
+    net::FeedHandler f(b);
+    const Packet p2 = packet("TEST", 1, 2, w.data(), 76);
+    CHECK(f.on_packet(p2.data(), p2.size()).kind == net::PacketKind::data);
+    const Packet shorty = packet("TEST", 1, 4, w.data(), 38);  // skip 2, but only 1 message carried
+    CHECK(f.on_packet(shorty.data(), shorty.size()).kind == net::PacketKind::malformed);
+    CHECK(f.malformed() == 1);
+}
+
 void test_feed_control_and_malformed() {
     Wire w;
     add(w, 1, 'B', 100, 1);
@@ -317,8 +354,9 @@ void test_feed_control_and_malformed() {
 }  // namespace
 
 int main() {
-    test_histogram_exact_below_128();
+    test_histogram_exact_below_256();
     test_histogram_bucket_bounds();
+    test_histogram_percentile_is_upper_bound();
     test_histogram_tail();
     test_mold_header_layout();
     test_skip_messages();
@@ -329,10 +367,12 @@ int main() {
     test_seq_in_order_and_gap();
     test_seq_stale_and_partial_overlap();
     test_seq_heartbeat_end_and_session();
+    test_seq_end_reveals_tail_gap();
     test_feed_in_order_matches_direct_parse();
     test_feed_duplicates_are_ignored();
     test_feed_drop_is_a_gap();
     test_feed_partial_overlap();
+    test_feed_skip_failure_is_malformed();
     test_feed_control_and_malformed();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

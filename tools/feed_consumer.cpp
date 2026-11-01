@@ -4,17 +4,28 @@
 // applied to the books.
 //
 //   feed_consumer [--group A] [--port P] [--iface A] [--rcvbuf BYTES] [--cpu N]
-//                 [--from HH:MM:SS] [--idle-timeout SECONDS]
+//                 [--from HH:MM:SS] [--start-timeout SECONDS] [--idle-timeout SECONDS]
 //
-// Latency is reported in two parts plus the total:
+// Latency is reported in two parts plus the total, and the service time:
 //   queue = recvmmsg() returned - kernel receive    (waiting in the socket buffer)
 //   book  = books updated       - recvmmsg() returned (parse + book updates, including
 //                                                      packets ahead of it in the batch)
-// Only packets whose first message is at or after --from are measured.
-// Exits nonzero on any gap, malformed or truncated packet, hard book invariant
-// violation, or if no end-of-session packet arrives.
+//   svc   = books updated       - start of this packet's own work: the later of
+//           recvmmsg() returned and the previous packet in the batch finishing
+//           (parse + book updates for this packet alone, no head-of-line wait)
+// Only packets whose first message is at or after --from are measured. Samples
+// where the realtime clock visibly stepped (backwards, or total > 10 s) are
+// counted as clock steps and left out. The forward cutoff is 10 s: a 256 MB
+// receive buffer can legitimately hold a backlog of more than 1 s.
+// Exits 1 if no datagram arrives within --start-timeout of joining (default
+// 30 s); after the first one, --idle-timeout (default 5 s) of silence ends the
+// run. Exits nonzero on any gap, malformed or truncated packet, packet without a
+// kernel timestamp, hard book invariant violation, or if no end-of-session
+// packet arrives.
 
+#include <algorithm>
 #include <cstdint>
+#include <exception>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,11 +50,11 @@ void print_hist(const char* name, const stats::Histogram& h) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int run(int argc, char** argv) {
     net::McastAddr addr;
     int rcvbuf = 256 << 20, cpu = -1;
     std::uint64_t from = 0;
-    double idle_s = 5;
+    double idle_s = 5, start_s = 30;
     for (int i = 1; i < argc; ++i) {
         auto opt = [&](const char* name) { return !std::strcmp(argv[i], name) && i + 1 < argc; };
         if (opt("--group")) addr.group = argv[++i];
@@ -52,6 +63,7 @@ int main(int argc, char** argv) {
         else if (opt("--rcvbuf")) rcvbuf = std::atoi(argv[++i]);
         else if (opt("--cpu")) cpu = std::atoi(argv[++i]);
         else if (opt("--from")) from = cli::parse_hms(argv[++i]);
+        else if (opt("--start-timeout")) start_s = std::atof(argv[++i]);
         else if (opt("--idle-timeout")) idle_s = std::atof(argv[++i]);
         else {
             std::fprintf(stderr, "unknown argument: %s\n", argv[i]);
@@ -72,11 +84,14 @@ int main(int argc, char** argv) {
     auto h_total = std::make_unique<stats::Histogram>();
     auto h_queue = std::make_unique<stats::Histogram>();
     auto h_book = std::make_unique<stats::Histogram>();
+    auto h_svc = std::make_unique<stats::Histogram>();
 
     std::uint64_t datagrams = 0, truncated = 0, missing_ts = 0, clock_anomalies = 0, messages = 0;
     std::uint64_t first_rx = 0, last_rx = 0;
     std::int64_t kernel_drops = 0;
     const auto idle_ns = static_cast<std::uint64_t>(idle_s * 1e9);
+    const auto start_ns = static_cast<std::uint64_t>(start_s * 1e9);
+    const std::uint64_t t_join = net::monotonic_ns();
     std::uint64_t last_activity = 0;
     bool idle_timeout = false;
 
@@ -87,9 +102,14 @@ int main(int argc, char** argv) {
                 idle_timeout = true;
                 break;
             }
+            if (!last_activity && net::monotonic_ns() - t_join > start_ns) {
+                std::printf("no packets received (start timeout)\n");
+                return 1;
+            }
             continue;
         }
         const std::uint64_t t_recv = net::realtime_ns();
+        std::uint64_t prev_t_done = t_recv;  // when the previous packet in this batch finished
         last_activity = net::monotonic_ns();
         for (int i = 0; i < n; ++i) {
             ++datagrams;
@@ -104,6 +124,8 @@ int main(int argc, char** argv) {
             const auto r = feed.on_packet(batch->data(i), batch->size(i));
             if (r.kind != net::PacketKind::data) continue;
             const std::uint64_t t_done = net::realtime_ns();
+            const std::uint64_t svc_start = std::max(t_recv, prev_t_done);
+            prev_t_done = t_done;
             messages += r.messages;
             if (rx_ns == 0) {
                 ++missing_ts;
@@ -112,13 +134,17 @@ int main(int argc, char** argv) {
             if (!first_rx) first_rx = rx_ns;
             last_rx = rx_ns;
             if (r.first_ts < from) continue;
-            if (t_recv < rx_ns || t_done < t_recv) {  // realtime clock stepped (WSL time sync)
+            // Realtime clock stepped (WSL time sync): backwards, or forwards by more than 10 s (a deep
+            // receive buffer can legitimately hold a >1 s backlog).
+            // svc_start >= t_recv, so t_done < svc_start also covers t_done < t_recv.
+            if (t_recv < rx_ns || t_done < svc_start || t_done - rx_ns > 10'000'000'000) {
                 ++clock_anomalies;
                 continue;
             }
             h_total->record(t_done - rx_ns);
             h_queue->record(t_recv - rx_ns);
             h_book->record(t_done - t_recv);
+            h_svc->record(t_done - svc_start);
         }
     }
 
@@ -153,7 +179,18 @@ int main(int argc, char** argv) {
     print_hist("total", *h_total);
     print_hist("queue", *h_queue);
     print_hist("book", *h_book);
+    print_hist("svc", *h_svc);
 
-    const bool ok = feed.ended() && s.gaps == 0 && feed.malformed() == 0 && truncated == 0 && v.hard() == 0;
+    const bool ok = feed.ended() && s.gaps == 0 && feed.malformed() == 0 && truncated == 0 && missing_ts == 0 &&
+                    v.hard() == 0;
     return ok ? 0 : 1;
+}
+
+int main(int argc, char** argv) {
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "error: %s\n", e.what());
+        return 1;
+    }
 }
