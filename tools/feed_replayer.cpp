@@ -78,26 +78,46 @@ int main(int argc, char** argv) {
     if (cpu >= 0 && !net::pin_to_cpu(cpu)) std::perror("pin_to_cpu");
 
     itch::MappedFile file(argv[1]);
-    file.prefault();
     net::Socket sock = net::open_mcast_sender(addr);
 
-    const unsigned char* p = file.data();
+    // Pre-scan: find where the replay stops (--limit, the first message at or
+    // after --to, or a framing error) and count the messages. Reading every
+    // block touches every page of the range, so the send loop never faults.
     const unsigned char* const end = file.end();
+    const unsigned char* stop = file.data();
+    std::uint64_t total = 0;
+    bool framing_error = false;
+    const std::uint64_t t_scan = net::monotonic_ns();
+    while (total < limit && stop != end) {
+        if (end - stop < 2) {
+            framing_error = true;
+            break;
+        }
+        const std::size_t len = itch::load_be16(stop);
+        if (len < sizeof(itch::Header) || static_cast<std::size_t>(end - stop) - 2 < len) {
+            framing_error = true;
+            break;
+        }
+        if (reinterpret_cast<const itch::Header*>(stop + 2)->timestamp >= to) break;
+        stop += 2 + len;
+        ++total;
+    }
+    std::printf("pre-scan:          %llu messages, %.2f GB in %.3f s\n", (unsigned long long)total,
+                double(stop - file.data()) / 1e9, double(net::monotonic_ns() - t_scan) / 1e9);
+    std::fflush(stdout);
+
+    const unsigned char* p = file.data();
     const double ns_per_msg = rate > 0 ? 1e9 / rate : 0;
     std::uint64_t seq = 1, msgs = 0, packets = 0, bytes = 0, send_errors = 0, max_late = 0;
-    bool anchored = false, framing_error = false;
+    bool anchored = false;
     std::uint64_t anchor_wall = 0, anchor_ts = 0;
     const std::uint64_t t_start = net::monotonic_ns();
 
-    while (msgs < limit) {
-        net::Span s = net::next_span(p, end, max_payload, ~0ULL, limit - msgs);
-        if (s.count == 0) {
-            framing_error = p != end;
-            break;
-        }
-        if (s.first_ts >= to) break;
+    while (p < stop) {
+        net::Span s = net::next_span(p, stop, max_payload, ~0ULL, ~0ULL);
+        if (s.count == 0) break;  // cannot happen: the pre-scan checked the framing up to stop
         const bool paced = speed > 0 && s.first_ts >= from;
-        if (paced) s = net::next_span(p, end, max_payload, 0, limit - msgs);
+        if (paced) s = net::next_span(p, stop, max_payload, 0, ~0ULL);
 
         std::uint64_t due = t_start + static_cast<std::uint64_t>(double(msgs) * ns_per_msg);
         if (paced) {
