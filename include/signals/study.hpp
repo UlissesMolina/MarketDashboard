@@ -26,19 +26,27 @@ struct Sample {
     double mid;
     std::array<double, kNumSignals> x;
     int next_move;   // 0 until resolved
-    double fwd_bps;  // NaN until resolved
+    double fwd_bps;  // NaN until resolved; labeled() needs it finite
 
-    [[nodiscard]] bool labeled() const noexcept { return next_move != 0 && !std::isnan(fwd_bps); }
+    [[nodiscard]] bool labeled() const noexcept { return next_move != 0 && std::isfinite(fwd_bps); }
 };
 
 // Labels one symbol's samples. Feed it every top-of-book change of that symbol
 // (on_change), and add() a sample right after the change it was taken at.
-// Timestamps must not decrease.
+// Timestamps must not decrease. Several messages of one event (an order that
+// sweeps many resting orders) share a timestamp and each changes the touch, so
+// the caller samples after each; only the sample after the last of them is a
+// real prediction, and earlier ones at the same timestamp are dropped (their
+// labels would be set by the rest of the same, already-decided event). add()
+// is ignored until the first on_change has set a positive mid.
 class Labeler {
 public:
     explicit Labeler(std::uint64_t horizon_ns) : horizon_(horizon_ns) {}
 
     void on_change(std::uint64_t ts, double new_mid) {
+        // Several messages of one event share a timestamp; only the sample taken after the last of them is a real prediction.
+        // Samples at or past both cursors are unresolved, so dropping them leaves the cursors valid.
+        while (s_.size() > std::max(move_from_, horizon_from_) && s_.back().ts == ts) s_.pop_back();
         // A change after t + horizon means the mid at t + horizon was the current one.
         while (horizon_from_ < s_.size() && s_[horizon_from_].ts + horizon_ < ts) {
             Sample& s = s_[horizon_from_++];
@@ -52,6 +60,7 @@ public:
     }
 
     void add(std::uint64_t ts, const std::array<double, kNumSignals>& x) {
+        if (mid_ <= 0) return;  // no mid yet: nothing to label against
         s_.push_back({ts, mid_, x, 0, std::numeric_limits<double>::quiet_NaN()});
     }
 
@@ -66,7 +75,7 @@ private:
 };
 
 struct Report {
-    std::size_t n = 0;                     // labeled samples
+    std::size_t n = 0;                     // labeled samples, from symbols with at least 10 of them
     std::size_t hits_n = 0;                // labeled samples with a nonzero signal
     double hit_rate = 0;                   // sign(signal) == next_move, over hits_n
     double corr = 0;                       // signal (standardized per symbol) vs fwd_bps

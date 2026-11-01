@@ -15,7 +15,7 @@
 namespace signals {
 
 struct Snapshot {
-    double imbalance;  // [-1, 1]
+    double imbalance;  // [-1, 1]; 0 if not two-sided
     double micro_bps;  // (microprice - mid) / mid, basis points; 0 if not two-sided
     double ofi;        // decayed order-flow imbalance, shares
     double flow;       // decayed signed trade volume, shares
@@ -64,7 +64,7 @@ public:
     [[nodiscard]] Snapshot snapshot(std::uint16_t locate, std::uint64_t ts) const {
         const State& s = states_[locate];
         const double m = two_sided(s.bbo) ? mid(s.bbo) : 0.0;
-        return {imbalance(s.bbo), m > 0 ? (microprice(s.bbo) - m) / m * 1e4 : 0.0, s.ofi.at(ts, tau_),
+        return {m > 0 ? imbalance(s.bbo) : 0.0, m > 0 ? (microprice(s.bbo) - m) / m * 1e4 : 0.0, s.ofi.at(ts, tau_),
                 s.flow.at(ts, tau_)};
     }
 

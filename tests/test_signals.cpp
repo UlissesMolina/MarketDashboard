@@ -150,6 +150,55 @@ void test_labeler_resolves_both_labels() {
     }
 }
 
+void test_engine_ofi_ignores_one_sided_and_crossed() {
+    signals::SignalEngine e(1e9);
+    const std::uint16_t loc = 1;
+    e.update_bbo(loc, 100, quote(10'000, 300, 10'002, 200));
+    e.update_bbo(loc, 100, quote(10'000, 400, 10'002, 200));  // OFI +100
+    CHECK(near(e.snapshot(loc, 100).ofi, 100));
+    CHECK(e.update_bbo(loc, 100, quote(10'001, 50, 0, 0)));  // ask side empties
+    CHECK(near(e.snapshot(loc, 100).ofi, 100));
+    CHECK(near(e.snapshot(loc, 100).imbalance, 0.0));
+    CHECK(e.update_bbo(loc, 100, quote(10'000, 400, 10'002, 200)));  // back; prev was one-sided
+    CHECK(near(e.snapshot(loc, 100).ofi, 100));
+    CHECK(e.update_bbo(loc, 100, quote(10'003, 70, 10'002, 30)));  // crossed
+    CHECK(near(e.snapshot(loc, 100).ofi, 100));
+    CHECK(near(e.snapshot(loc, 100).imbalance, 0.0) && near(e.snapshot(loc, 100).micro_bps, 0.0));
+    CHECK(e.update_bbo(loc, 100, quote(10'000, 100, 10'002, 50)));  // uncrossed; prev was crossed
+    CHECK(near(e.snapshot(loc, 100).ofi, 100));
+}
+
+void test_labeler_same_timestamp_keeps_last_sample() {
+    signals::Labeler lab(150);
+    const std::array<double, signals::kNumSignals> x{1, 1, 1, 1}, y{2, 2, 2, 2};
+    lab.add(50, x);  // no mid yet: ignored
+    CHECK(lab.samples().empty());
+    lab.on_change(100, 10'000);
+    lab.add(100, x);
+    lab.on_change(100, 10'002);  // same event, mid moves up
+    lab.add(100, y);
+    lab.on_change(500, 10'001);  // mid down
+    const auto& s = lab.samples();
+    CHECK(s.size() == 1);
+    if (s.size() == 1) {
+        CHECK(s[0].ts == 100 && s[0].x[0] == 2 && s[0].mid == 10'002);
+        CHECK(s[0].next_move == -1);  // m3 vs m2, not m2 vs m
+        CHECK(near(s[0].fwd_bps, 0.0));
+    }
+}
+
+void test_labeler_horizon_boundary() {
+    signals::Labeler lab(150);
+    const std::array<double, signals::kNumSignals> x{1, 2, 3, 4};
+    lab.on_change(100, 10'000);
+    lab.add(100, x);
+    lab.on_change(250, 10'004);  // exactly t + H: the post-change mid is the one in force
+    lab.on_change(260, 10'006);
+    const auto& s = lab.samples();
+    CHECK(s.size() == 1);
+    if (s.size() == 1) CHECK(near(s[0].fwd_bps, (10'004.0 - 10'000) / 10'000 * 1e4));
+}
+
 std::vector<signals::Sample> synthetic(double scale, std::uint64_t n) {
     std::vector<signals::Sample> v;
     for (std::uint64_t i = 0; i < n; ++i) {
@@ -184,8 +233,11 @@ int main() {
     test_signed_volume_and_decay();
     test_engine_bbo_changes_and_ofi();
     test_engine_trade_flow();
+    test_engine_ofi_ignores_one_sided_and_crossed();
     test_engine_as_book_listener();
     test_labeler_resolves_both_labels();
+    test_labeler_same_timestamp_keeps_last_sample();
+    test_labeler_horizon_boundary();
     test_evaluate_perfect_signal_across_scales();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
