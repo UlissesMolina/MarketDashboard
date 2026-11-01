@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 #include "book/levels.hpp"
@@ -45,6 +46,8 @@ struct Violations {
 struct Bbo {
     std::uint32_t bid = 0, ask = 0;  // 0 = side empty
     std::uint64_t bid_shares = 0, ask_shares = 0;
+
+    friend bool operator==(const Bbo&, const Bbo&) = default;
 };
 
 template <template <bool> class Levels>
@@ -61,15 +64,34 @@ struct Book {
     }
 };
 
-template <template <bool> class Levels>
+// A BookBuilder listener is told about every book update and every execution
+// against a displayed order:
+//   template <class B> void on_book_update(std::uint16_t locate, std::uint64_t ts, const B& book);
+//   void on_execution(std::uint16_t locate, std::uint64_t ts, char resting_side,
+//                     std::uint32_t shares, std::uint32_t price);
+// on_book_update runs after the change; on_execution runs before the book
+// changes, with shares clamped to what the order had left. on_execution covers
+// printable executions against displayed orders; non-printable 'C' executions
+// (cross fills, reported again in 'Q') change the book but are not reported as
+// trades. NullListener compiles to nothing.
+struct NullListener {};
+
+template <template <bool> class Levels, class Listener = NullListener>
 class BookBuilder {
+    static constexpr bool kListening = !std::is_same_v<Listener, NullListener>;
+
 public:
     static constexpr std::size_t kMaxLocate = 65536;
 
     // audit_times: nanoseconds since midnight at which to run audit() mid-feed
     // (on the first add at or after each time). Their cost is reported separately.
-    explicit BookBuilder(unsigned order_map_log2 = 22, std::vector<std::uint64_t> audit_times = {})
-        : orders_(order_map_log2), books_(kMaxLocate), symbols_(kMaxLocate), audit_times_(std::move(audit_times)) {
+    explicit BookBuilder(unsigned order_map_log2 = 22, std::vector<std::uint64_t> audit_times = {},
+                         Listener listener = {})
+        : orders_(order_map_log2),
+          books_(kMaxLocate),
+          symbols_(kMaxLocate),
+          audit_times_(std::move(audit_times)),
+          listener_(std::move(listener)) {
         std::sort(audit_times_.begin(), audit_times_.end());
     }
 
@@ -87,21 +109,37 @@ public:
     void on(const itch::StockTradingAction& m) { books_[m.hdr.stock_locate].trading_state = m.trading_state; }
 
     void on(const itch::AddOrder& m) {
+        set_now(m.hdr.timestamp);
         maybe_audit(m.hdr.timestamp);
         add(m.hdr.stock_locate, m.order_ref, m.side, m.shares, m.price);
     }
     void on(const itch::AddOrderMpid& m) {
+        set_now(m.hdr.timestamp);
         maybe_audit(m.hdr.timestamp);
         add(m.hdr.stock_locate, m.order_ref, m.side, m.shares, m.price);
     }
-    void on(const itch::OrderExecuted& m) { reduce(m.hdr.stock_locate, m.order_ref, m.executed_shares, false); }
-    void on(const itch::OrderExecutedWithPrice& m) {
+    void on(const itch::OrderExecuted& m) {
+        set_now(m.hdr.timestamp);
+        notify_execution(m.hdr.stock_locate, m.order_ref, m.executed_shares, 0);
         reduce(m.hdr.stock_locate, m.order_ref, m.executed_shares, false);
     }
-    void on(const itch::OrderCancel& m) { reduce(m.hdr.stock_locate, m.order_ref, m.cancelled_shares, false); }
-    void on(const itch::OrderDelete& m) { reduce(m.hdr.stock_locate, m.order_ref, 0, true); }
+    void on(const itch::OrderExecutedWithPrice& m) {
+        set_now(m.hdr.timestamp);
+        if (m.printable == 'Y')
+            notify_execution(m.hdr.stock_locate, m.order_ref, m.executed_shares, m.execution_price);
+        reduce(m.hdr.stock_locate, m.order_ref, m.executed_shares, false);
+    }
+    void on(const itch::OrderCancel& m) {
+        set_now(m.hdr.timestamp);
+        reduce(m.hdr.stock_locate, m.order_ref, m.cancelled_shares, false);
+    }
+    void on(const itch::OrderDelete& m) {
+        set_now(m.hdr.timestamp);
+        reduce(m.hdr.stock_locate, m.order_ref, 0, true);
+    }
 
     void on(const itch::OrderReplace& m) {
+        set_now(m.hdr.timestamp);
         const std::uint16_t locate = m.hdr.stock_locate;
         Order* o = find(locate, m.original_order_ref);
         if (!o) return;
@@ -129,6 +167,8 @@ public:
     };
 
     [[nodiscard]] const Violations& violations() const noexcept { return v_; }
+    [[nodiscard]] Listener& listener() noexcept { return listener_; }
+    [[nodiscard]] const Listener& listener() const noexcept { return listener_; }
     [[nodiscard]] const Book<Levels>& book(std::uint16_t locate) const { return books_[locate]; }
     // Mutable access so tests can corrupt a book and prove audit() notices.
     [[nodiscard]] Book<Levels>& book_for_test(std::uint16_t locate) { return books_[locate]; }
@@ -191,6 +231,22 @@ private:
             audits_.push_back({ts, orders_.size(), audit()});
             audit_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             ++next_audit_;
+        }
+    }
+
+    void set_now([[maybe_unused]] std::uint64_t ts) noexcept {
+        if constexpr (kListening) now_ = ts;
+    }
+
+    // Tells the listener about an execution against a live displayed order,
+    // before the book changes. price == 0 means "at the order's own price" ('E').
+    void notify_execution([[maybe_unused]] std::uint16_t locate, [[maybe_unused]] std::uint64_t ref,
+                          [[maybe_unused]] std::uint32_t shares, [[maybe_unused]] std::uint32_t price) {
+        if constexpr (kListening) {
+            const Order* o = orders_.find(ref);
+            if (!o || o->locate != locate) return;  // reduce() counts the violation
+            listener_.on_execution(locate, now_, o->side, std::min<std::uint32_t>(shares, o->shares),
+                                   price ? price : o->price);
         }
     }
 
@@ -279,6 +335,7 @@ private:
         h = h * 0x100000001B3ULL ^ q.bid_shares;
         h = h * 0x100000001B3ULL ^ q.ask_shares;
         tob_hash_ = (tob_hash_ ^ h) * 0x9E3779B97F4A7C15ULL;
+        if constexpr (kListening) listener_.on_book_update(locate, now_, b);
     }
 
     OrderMap orders_;
@@ -287,6 +344,7 @@ private:
     std::vector<ClosingCross> closing_crosses_;
     std::vector<Bbo> close_bbo_;
     std::vector<std::uint64_t> audit_times_;
+    [[no_unique_address]] Listener listener_;
     std::size_t next_audit_ = 0;
     std::vector<AuditResult> audits_;
     double audit_seconds_ = 0;
@@ -294,6 +352,7 @@ private:
     std::size_t peak_live_ = 0;
     std::uint64_t tob_hash_ = 0;
     bool market_open_ = false;
+    std::uint64_t now_ = 0;  // timestamp of the message being applied
 };
 
 }  // namespace book

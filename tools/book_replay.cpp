@@ -3,7 +3,10 @@
 // symbol's official closing-cross price with its book at the 16:00 bell.
 //
 //   book_replay <file> [--levels vector|map] [--order-map-log2 N] [--repeat N]
-//               [--show SYM,...]
+//               [--show SYM,...] [--signals]
+//
+// --signals attaches the signal engine (all symbols) so its cost shows up in the
+// throughput; the top-of-book hash must not change.
 
 #include <algorithm>
 #include <chrono>
@@ -14,11 +17,13 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "book/book_builder.hpp"
 #include "itch/mapped_file.hpp"
 #include "itch/parser.hpp"
+#include "signals/signal_engine.hpp"
 
 namespace {
 
@@ -28,7 +33,7 @@ constexpr std::uint64_t hms(int h, int m, int s) { return ((h * 60ULL + m) * 60 
 
 struct NullHandler {};  // parse-only: every message type is skipped at compile time
 
-template <template <bool> class L>
+template <template <bool> class L, class Listener = book::NullListener>
 int run(const itch::MappedFile& file, const std::vector<std::string>& show, unsigned map_log2, int repeat) {
     // Parse-only pass: if this is far above ~2 s, pages are coming from disk and
     // the book timings below are I/O-bound, not a measurement of the books.
@@ -39,12 +44,12 @@ int run(const itch::MappedFile& file, const std::vector<std::string>& show, unsi
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count(),
                 (unsigned long long)pr.messages);
 
-    std::unique_ptr<book::BookBuilder<L>> builder;
+    std::unique_ptr<book::BookBuilder<L, Listener>> builder;
     itch::ParseResult r;
     std::vector<double> secs;
     for (int i = 0; i < repeat; ++i) {
         // Audit mid-session, when the books are full; at end of day they are empty.
-        builder = std::make_unique<book::BookBuilder<L>>(
+        builder = std::make_unique<book::BookBuilder<L, Listener>>(
             map_log2, std::vector<std::uint64_t>{hms(9, 30, 1), hms(12, 0, 0), hms(15, 59, 59)});
         const auto t0 = std::chrono::steady_clock::now();
         r = itch::parse(file.data(), file.end(), *builder);
@@ -61,6 +66,15 @@ int run(const itch::MappedFile& file, const std::vector<std::string>& show, unsi
     std::printf("peak live orders:  %zu\n", builder->peak_live_orders());
     std::printf("live at end:       %zu\n", builder->live_orders());
     std::printf("top-of-book hash:  %016llx\n", (unsigned long long)builder->tob_hash());
+    if constexpr (!std::is_same_v<Listener, book::NullListener>) {
+        std::uint64_t changes = 0, execs = 0;
+        for (std::size_t l = 0; l < signals::SignalEngine::kMaxLocate; ++l) {
+            changes += builder->listener().bbo_changes(static_cast<std::uint16_t>(l));
+            execs += builder->listener().executions(static_cast<std::uint16_t>(l));
+        }
+        std::printf("signals: %llu bbo changes, %llu executions\n", (unsigned long long)changes,
+                    (unsigned long long)execs);
+    }
 
     const auto& v = builder->violations();
     std::printf("\ninvariants\n");
@@ -131,15 +145,19 @@ int run(const itch::MappedFile& file, const std::vector<std::string>& show, unsi
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <itch-file> [--levels vector|map] [--show SYM,SYM,...]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <itch-file> [--levels vector|map] [--order-map-log2 N] [--repeat N] "
+                     "[--show SYM,...] [--signals]\n", argv[0]);
         return 2;
     }
     std::string levels = "vector";
     unsigned map_log2 = 22;
     int repeat = 1;
+    bool with_signals = false;
     std::vector<std::string> show = {"QQQ", "AAPL", "MSFT", "AMZN", "GOOGL", "FB", "NVDA"};
     for (int i = 2; i < argc; ++i) {
-        if (!std::strcmp(argv[i], "--levels") && i + 1 < argc) {
+        if (!std::strcmp(argv[i], "--signals")) {
+            with_signals = true;
+        } else if (!std::strcmp(argv[i], "--levels") && i + 1 < argc) {
             levels = argv[++i];
         } else if (!std::strcmp(argv[i], "--repeat") && i + 1 < argc) {
             repeat = std::max(1, std::atoi(argv[++i]));
@@ -157,9 +175,14 @@ int main(int argc, char** argv) {
 
     itch::MappedFile file(argv[1]);
     file.prefault();
-    std::printf("levels policy:     %s, order map 2^%u slots\n", levels.c_str(), map_log2);
-    if (levels == "vector") return run<book::VectorLevels>(file, show, map_log2, repeat);
-    if (levels == "map") return run<book::MapLevels>(file, show, map_log2, repeat);
+    std::printf("levels policy:     %s, order map 2^%u slots%s\n", levels.c_str(), map_log2,
+                with_signals ? ", signal engine attached" : "");
+    if (levels == "vector")
+        return with_signals ? run<book::VectorLevels, signals::SignalEngine>(file, show, map_log2, repeat)
+                            : run<book::VectorLevels>(file, show, map_log2, repeat);
+    if (levels == "map")
+        return with_signals ? run<book::MapLevels, signals::SignalEngine>(file, show, map_log2, repeat)
+                            : run<book::MapLevels>(file, show, map_log2, repeat);
     std::fprintf(stderr, "unknown levels policy: %s\n", levels.c_str());
     return 2;
 }

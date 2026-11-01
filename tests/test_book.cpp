@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <random>
 #include <unordered_map>
+#include <vector>
 
 #include "book/book_builder.hpp"
 #include "itch/parser.hpp"
@@ -233,8 +234,99 @@ void test_scheduled_audits() {
     }
 }
 
+// Records every listener callback so tests can check what BookBuilder reports.
+struct Recorder {
+    struct Update {
+        std::uint16_t locate;
+        std::uint64_t ts;
+        book::Bbo bbo;
+    };
+    struct Exec {
+        std::uint16_t locate;
+        std::uint64_t ts;
+        char side;
+        std::uint32_t shares;
+        std::uint32_t price;
+    };
+    std::vector<Update> updates;
+    std::vector<Exec> execs;
+
+    template <class B>
+    void on_book_update(std::uint16_t locate, std::uint64_t ts, const B& b) {
+        updates.push_back({locate, ts, b.bbo()});
+    }
+    void on_execution(std::uint16_t locate, std::uint64_t ts, char side, std::uint32_t shares, std::uint32_t price) {
+        execs.push_back({locate, ts, side, shares, price});
+    }
+};
+
+// Same messages as the helpers above, but with explicit timestamps.
+Wire listener_feed() {
+    Wire w;
+    w.header('A', kLoc, 0, 100).be(1, 8).ch('B').be(100, 4).str("TEST", 8).be(10'000, 4).end();
+    w.header('A', kLoc, 0, 200).be(2, 8).ch('S').be(50, 4).str("TEST", 8).be(10'100, 4).end();
+    w.header('E', kLoc, 0, 300).be(1, 8).be(30, 4).be(1, 8).end();                         // exec at order price
+    w.header('C', kLoc, 0, 400).be(2, 8).be(20, 4).be(2, 8).ch('Y').be(10'099, 4).end();   // exec with price
+    w.header('E', kLoc, 0, 500).be(1, 8).be(999, 4).be(3, 8).end();                        // overfill: clamp to 70
+    w.header('E', kLoc, 0, 600).be(9, 8).be(10, 4).be(4, 8).end();                         // unknown ref
+    w.header('E', kLoc + 1, 0, 650).be(2, 8).be(5, 4).be(5, 8).end();                      // wrong locate
+    w.header('X', kLoc, 0, 700).be(2, 8).be(10, 4).end();                                  // cancel: not an exec
+    w.header('F', kLoc, 0, 800).be(10, 8).ch('B').be(25, 4).str("TEST", 8).be(9'990, 4).str("MPID", 4).end();
+    w.header('U', kLoc, 0, 900).be(2, 8).be(11, 8).be(15, 4).be(10'105, 4).end();          // replace: one update
+    w.header('D', kLoc, 0, 1000).be(10, 8).end();
+    w.header('C', kLoc, 0, 1100).be(11, 8).be(5, 4).be(6, 8).ch('N').be(10'105, 4).end();  // non-printable: book only
+    return w;
+}
+
+template <template <bool> class L>
+void test_listener_sees_updates_and_executions() {
+    const Wire w = listener_feed();
+    book::BookBuilder<L, Recorder> b(4);
+    itch::parse(w.data(), w.data_end(), b);
+    const Recorder& r = b.listener();
+
+    // One update per book change: 3 adds (A, A, F), 3 executions, 1 cancel, 1 replace,
+    // 1 delete, 1 non-printable execution. Unknown ref and wrong locate change nothing
+    // and report nothing.
+    CHECK(r.updates.size() == 10);
+    if (r.updates.size() == 10) {
+        const std::uint64_t ts[] = {100, 200, 300, 400, 500, 700, 800, 900, 1000, 1100};
+        for (std::size_t i = 0; i < 10; ++i) CHECK(r.updates[i].ts == ts[i] && r.updates[i].locate == kLoc);
+        CHECK(r.updates[2].bbo.bid == 10'000 && r.updates[2].bbo.bid_shares == 70);
+        CHECK(r.updates[4].bbo.bid == 0);  // order 1 fully executed
+        CHECK(r.updates[5].bbo.ask == 10'100 && r.updates[5].bbo.ask_shares == 20);
+        CHECK(r.updates[6].bbo == (book::Bbo{9'990, 10'100, 25, 20}));    // F: new best bid
+        CHECK(r.updates[7].bbo == (book::Bbo{9'990, 10'105, 25, 15}));    // U: ask moves, single update
+        CHECK(r.updates[8].bbo == (book::Bbo{0, 10'105, 0, 15}));         // D: bid gone
+        CHECK(r.updates[9].bbo == (book::Bbo{0, 10'105, 0, 10}));         // C 'N': book changes
+    }
+
+    CHECK(r.execs.size() == 3);
+    if (r.execs.size() == 3) {
+        CHECK(r.execs[0].ts == 300 && r.execs[0].side == 'B' && r.execs[0].shares == 30 && r.execs[0].price == 10'000);
+        CHECK(r.execs[1].ts == 400 && r.execs[1].side == 'S' && r.execs[1].shares == 20 && r.execs[1].price == 10'099);
+        CHECK(r.execs[2].ts == 500 && r.execs[2].side == 'B' && r.execs[2].shares == 70 && r.execs[2].price == 10'000);
+    }
+}
+
+template <template <bool> class L>
+void test_listener_does_not_change_books() {
+    const Wire w = listener_feed();
+    book::BookBuilder<L> plain(4);
+    book::BookBuilder<L, Recorder> listened(4);
+    itch::parse(w.data(), w.data_end(), plain);
+    itch::parse(w.data(), w.data_end(), listened);
+    CHECK(plain.tob_hash() == listened.tob_hash());
+    CHECK(plain.live_orders() == listened.live_orders());
+    CHECK(plain.violations().unknown_ref == listened.violations().unknown_ref);
+    CHECK(plain.violations().locate_mismatch == listened.violations().locate_mismatch);
+    CHECK(plain.book(kLoc).bbo() == listened.book(kLoc).bbo());
+}
+
 template <template <bool> class L>
 void run_book_tests() {
+    test_listener_sees_updates_and_executions<L>();
+    test_listener_does_not_change_books<L>();
     test_audit_detects_corruption<L>();
     test_scheduled_audits<L>();
     test_levels_aggregate_and_bbo<L>();
