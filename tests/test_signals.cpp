@@ -187,6 +187,16 @@ void test_labeler_same_timestamp_keeps_last_sample() {
     }
 }
 
+void test_labeler_drop_at_removes_same_event_samples() {
+    signals::Labeler lab(150);
+    const std::array<double, signals::kNumSignals> x{1, 1, 1, 1};
+    lab.on_change(100, 10'000);
+    lab.add(100, x);
+    lab.drop_at(100);  // the event ended one-sided
+    lab.on_change(500, 10'002);
+    CHECK(lab.samples().empty());
+}
+
 void test_labeler_horizon_boundary() {
     signals::Labeler lab(150);
     const std::array<double, signals::kNumSignals> x{1, 2, 3, 4};
@@ -237,6 +247,7 @@ int main() {
     test_engine_as_book_listener();
     test_labeler_resolves_both_labels();
     test_labeler_same_timestamp_keeps_last_sample();
+    test_labeler_drop_at_removes_same_event_samples();
     test_labeler_horizon_boundary();
     test_evaluate_perfect_signal_across_scales();
     if (failures) {

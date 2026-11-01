@@ -6,7 +6,6 @@
 //   feed_consumer [--group A] [--port P] [--iface A] [--rcvbuf BYTES] [--cpu N]
 //                 [--from HH:MM:SS] [--start-timeout SECONDS] [--idle-timeout SECONDS]
 //                 [--signals] [--show SYM,...]
-//                 [--signals] [--show SYM,...]
 //
 // Latency is reported in two parts plus the total, and the service time:
 //   queue = recvmmsg() returned - kernel receive    (waiting in the socket buffer)
@@ -21,8 +20,10 @@
 // receive buffer can legitimately hold a backlog of more than 1 s.
 // --signals attaches the signal engine (all symbols), so its cost lands in the
 // book and svc histograms; --show lists symbols whose final signals are printed
-// (default AAPL,MSFT,QQQ). Without --signals the listener is one predictable
-// null check per book update.
+// (default AAPL,MSFT,QQQ) and implies --signals. Without --signals the listener
+// still costs a null check per book update, an extra order lookup per execution
+// and a timestamp store per message, so that mode is not byte-identical to the
+// Stage 3 consumer.
 // Exits 1 if no datagram arrives within --start-timeout of joining (default
 // 30 s); after the first one, --idle-timeout (default 5 s) of silence ends the
 // run. Exits nonzero on any gap, malformed or truncated packet, packet without a
@@ -30,15 +31,13 @@
 // packet arrives.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
-#include <exception>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
-#include <sstream>
-#include <string>
-#include <vector>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -48,7 +47,6 @@
 #include "net/feed_handler.hpp"
 #include "net/os.hpp"
 #include "net/udp.hpp"
-#include "signals/signal_engine.hpp"
 #include "signals/signal_engine.hpp"
 #include "stats/histogram.hpp"
 
@@ -104,6 +102,7 @@ int run(int argc, char** argv) {
             return 2;
         }
     }
+    if (!show.empty()) with_signals = true;
     if (cpu >= 0 && !net::pin_to_cpu(cpu)) std::perror("pin_to_cpu");
 
     int granted = 0;
@@ -224,9 +223,10 @@ int run(int argc, char** argv) {
             const auto l = static_cast<std::uint16_t>(loc);
             const book::Bbo& q = engine->bbo(l);
             const signals::Snapshot x = engine->snapshot(l, engine->last_ts());
+            auto r0 = [](double v) { return std::fabs(v) < 0.5 ? 0.0 : v; };
             std::printf("  %-6s %9.4f x %-9.4f  imbalance %+.3f  micro %+.2f bps  ofi %+.0f  flow %+.0f  "
                         "(%llu bbo changes, %llu executions)\n",
-                        sym.c_str(), q.bid / 1e4, q.ask / 1e4, x.imbalance, x.micro_bps, x.ofi, x.flow,
+                        sym.c_str(), q.bid / 1e4, q.ask / 1e4, x.imbalance, x.micro_bps, r0(x.ofi), r0(x.flow),
                         (unsigned long long)engine->bbo_changes(l), (unsigned long long)engine->executions(l));
         }
     }

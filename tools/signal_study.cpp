@@ -10,6 +10,8 @@
 // two-sided, and the time is in [--from, --to). Defaults: 09:35:00-15:55:00,
 // horizon 1000 ms, tau 1000 ms.
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -46,7 +48,11 @@ struct StudyListener {
         const book::Bbo q = b.bbo();
         if (!engine.update_bbo(locate, ts, q)) return;
         signals::Labeler* lab = labelers[locate].get();
-        if (!lab || !signals::two_sided(q)) return;
+        if (!lab) return;
+        if (!signals::two_sided(q)) {
+            lab->drop_at(ts);
+            return;
+        }
         lab->on_change(ts, signals::mid(q));
         if (ts < from || ts >= to || b.trading_state != 'T') return;
         const signals::Snapshot s = engine.snapshot(locate, ts);
@@ -117,9 +123,15 @@ int run(int argc, char** argv) {
             std::printf("  %-6s not in directory, skipped\n", sym.c_str());
             continue;
         }
+        if (std::find(watched.begin(), watched.end(), static_cast<std::uint16_t>(loc)) != watched.end()) continue;
         watched.push_back(static_cast<std::uint16_t>(loc));
         listener.labelers[static_cast<std::size_t>(loc)] =
             std::make_unique<signals::Labeler>(static_cast<std::uint64_t>(horizon_ms * 1e6));
+    }
+
+    if (watched.empty()) {
+        std::fprintf(stderr, "error: none of the requested symbols is in the directory\n");
+        return 2;
     }
 
     auto books = std::make_unique<book::BookBuilder<book::VectorLevels, StudyListener>>(
@@ -129,10 +141,13 @@ int run(int argc, char** argv) {
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
     const StudyListener& L = books->listener();
-    std::printf("signal study: %zu symbols, %02llu:%02llu-%02llu:%02llu, horizon %.0f ms, tau %.0f ms\n",
-                watched.size(), (unsigned long long)(from / 3'600'000'000'000ULL),
-                (unsigned long long)(from / 60'000'000'000ULL % 60), (unsigned long long)(to / 3'600'000'000'000ULL),
-                (unsigned long long)(to / 60'000'000'000ULL % 60), horizon_ms, tau_ms);
+    auto hms = [](std::uint64_t ns) {
+        return std::array<unsigned long long, 3>{ns / 3'600'000'000'000ULL, ns / 60'000'000'000ULL % 60,
+                                                 ns / 1'000'000'000ULL % 60};
+    };
+    const auto f = hms(from), t = hms(to);
+    std::printf("signal study: %zu symbols, %02llu:%02llu:%02llu-%02llu:%02llu:%02llu, horizon %.0f ms, tau %.0f ms\n",
+                watched.size(), f[0], f[1], f[2], t[0], t[1], t[2], horizon_ms, tau_ms);
     std::printf("replay: %llu messages in %.2f s (%.1f ns/msg, books + signals for all symbols)\n",
                 (unsigned long long)pr.messages, secs, secs * 1e9 / double(pr.messages));
     std::printf("top-of-book hash: %016llx\n\n", (unsigned long long)books->tob_hash());

@@ -17,12 +17,13 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "book/book_builder.hpp"
-#include "signals/signal_engine.hpp"
 #include "itch/mapped_file.hpp"
 #include "itch/parser.hpp"
+#include "signals/signal_engine.hpp"
 
 namespace {
 
@@ -65,6 +66,15 @@ int run(const itch::MappedFile& file, const std::vector<std::string>& show, unsi
     std::printf("peak live orders:  %zu\n", builder->peak_live_orders());
     std::printf("live at end:       %zu\n", builder->live_orders());
     std::printf("top-of-book hash:  %016llx\n", (unsigned long long)builder->tob_hash());
+    if constexpr (!std::is_same_v<Listener, book::NullListener>) {
+        std::uint64_t changes = 0, execs = 0;
+        for (std::size_t l = 0; l < signals::SignalEngine::kMaxLocate; ++l) {
+            changes += builder->listener().bbo_changes(static_cast<std::uint16_t>(l));
+            execs += builder->listener().executions(static_cast<std::uint16_t>(l));
+        }
+        std::printf("signals: %llu bbo changes, %llu executions\n", (unsigned long long)changes,
+                    (unsigned long long)execs);
+    }
 
     const auto& v = builder->violations();
     std::printf("\ninvariants\n");
@@ -135,7 +145,8 @@ int run(const itch::MappedFile& file, const std::vector<std::string>& show, unsi
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <itch-file> [--levels vector|map] [--show SYM,SYM,...]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <itch-file> [--levels vector|map] [--order-map-log2 N] [--repeat N] "
+                     "[--show SYM,...] [--signals]\n", argv[0]);
         return 2;
     }
     std::string levels = "vector";
