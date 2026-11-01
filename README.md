@@ -2,44 +2,50 @@
 
 A C++20 market-data pipeline built on Nasdaq's free TotalView-ITCH sample files
 (<https://emi.nasdaq.com/ITCH/>): parse the binary feed, keep an order book for every
-symbol, deliver it over UDP multicast and measure tick-to-book latency.
+symbol, deliver it over UDP multicast and measure tick-to-book latency, then compute
+microstructure signals on the books and test whether they predict the next move.
 
 | Stage | What | Status |
 |---|---|---|
 | 1 | Zero-copy ITCH parser + throughput benchmark | done |
 | 2 | Order books for every symbol, with invariant checks | done |
 | 3 | UDP multicast replayer + real-time consumer, tick-to-book latency | done |
-| 4 | Real-time microstructure signals | optional |
+| 4 | Real-time microstructure signals, with an offline predictive test | done |
 
 ## Layout
 
 ```
-include/itch/endian.hpp       BigEndian<N>: alignment-1 big-endian fields, decoded on access
-include/itch/messages.hpp     all ITCH 5.0 message structs, sizes pinned by static_assert
-include/itch/parser.hpp       parse(begin, end, handler): in-place walk + switch dispatch
-include/itch/mapped_file.hpp  RAII read-only mmap
-include/book/order_map.hpp    open-addressing order-ref -> live order map
-include/book/levels.hpp       L2 price levels: VectorLevels and MapLevels policies
-include/book/book_builder.hpp per-symbol books + feed invariant checks, as a parse handler
-include/net/mold.hpp          MoldUDP64 header, packetizer (file slices -> packets)
-include/net/seq_tracker.hpp   session lock, gap / duplicate / overlap detection
-include/net/feed_handler.hpp  socket-free packet -> books step, shared by tests and consumer
-include/net/udp.hpp           multicast sockets, recvmmsg batch with kernel timestamps
-include/net/os.hpp            clocks and CPU pinning
-include/stats/histogram.hpp   fixed-size log-linear latency histogram
+include/itch/endian.hpp           BigEndian<N>: alignment-1 big-endian fields, decoded on access
+include/itch/messages.hpp         all ITCH 5.0 message structs, sizes pinned by static_assert
+include/itch/parser.hpp           parse(begin, end, handler): in-place walk + switch dispatch
+include/itch/mapped_file.hpp      RAII read-only mmap
+include/book/order_map.hpp        open-addressing order-ref -> live order map
+include/book/levels.hpp           L2 price levels: VectorLevels and MapLevels policies
+include/book/book_builder.hpp     per-symbol books + feed invariant checks, as a parse handler
+include/net/mold.hpp              MoldUDP64 header, packetizer (file slices -> packets)
+include/net/seq_tracker.hpp       session lock, gap / duplicate / overlap detection
+include/net/feed_handler.hpp      socket-free packet -> books step, shared by tests and consumer
+include/net/udp.hpp               multicast sockets, recvmmsg batch with kernel timestamps
+include/net/os.hpp                clocks and CPU pinning
+include/stats/histogram.hpp       fixed-size log-linear latency histogram
+include/signals/signals.hpp       imbalance, microprice, OFI, signed trade flow, decaying sums
+include/signals/signal_engine.hpp per-symbol signal state, a BookBuilder listener
+include/signals/study.hpp         forward labels (next move, horizon return) and evaluation
 
-tools/itch_stats.cpp          zero-copy benchmark: per-type counts, checksum, msgs/s
-tools/itch_naive.cpp          ifstream + per-message allocation baseline, independent decoder
-tools/itch_profile.cpp        measures ref range, peak live orders, locates, price ranges
-tools/book_replay.cpp         full-day book rebuild: invariants, audits, closing crosses
-tools/feed_replayer.cpp       file -> paced MoldUDP64 multicast (zero-copy sendmsg)
-tools/feed_consumer.cpp       multicast -> books, tick-to-book latency report
-tools/feed_bench.sh           runs consumer + replayer together
+tools/itch_stats.cpp              zero-copy benchmark: per-type counts, checksum, msgs/s
+tools/itch_naive.cpp              ifstream + per-message allocation baseline, independent decoder
+tools/itch_profile.cpp            measures ref range, peak live orders, locates, price ranges
+tools/book_replay.cpp             full-day book rebuild: invariants, audits, closing crosses
+tools/feed_replayer.cpp           file -> paced MoldUDP64 multicast (zero-copy sendmsg)
+tools/feed_consumer.cpp           multicast -> books, tick-to-book latency report
+tools/feed_bench.sh               runs consumer + replayer together
+tools/signal_study.cpp            offline test: does each signal predict the next move?
 
-tests/test_parser.cpp         hand-built wire bytes
-tests/test_book.cpp           order map, level policies, book invariants
-tests/test_net.cpp            framing, sequencing, drop/dup/overlap through the books
-tests/test_udp.cpp            loopback multicast smoke test (real sockets)
+tests/test_parser.cpp             hand-built wire bytes
+tests/test_book.cpp               order map, level policies, book invariants
+tests/test_net.cpp                framing, sequencing, drop/dup/overlap through the books
+tests/test_udp.cpp                loopback multicast smoke test (real sockets)
+tests/test_signals.cpp            formulas, engine, labeler, evaluation
 ```
 
 Unit tests run under ASan/UBSan; everything builds with `-Wall -Wextra -Wpedantic -Werror`.
@@ -54,6 +60,8 @@ Unit tests run under ASan/UBSan; everything builds with `-Wall -Wextra -Wpedanti
 bash tools/feed_bench.sh ~/itch/01302019.NASDAQ_ITCH50 --rate 5e6   # full day over multicast
 bash tools/feed_bench.sh ~/itch/01302019.NASDAQ_ITCH50 \
     --speed 1 --from 09:29:30 --to 09:35:00 --batch-ns 10000         # real-time market open
+./build/signal_study ~/itch/01302019.NASDAQ_ITCH50                 # predictive test, 10 liquid symbols
+./build/book_replay ~/itch/01302019.NASDAQ_ITCH50 --signals        # cost of the signal engine
 ```
 
 - **Data.** Download a `*.NASDAQ_ITCH50.gz` file from the link above and `gunzip -k`
@@ -68,6 +76,11 @@ bash tools/feed_bench.sh ~/itch/01302019.NASDAQ_ITCH50 \
   it actually got; "capped by net.core.rmem_max" means drops will come early.
   `feed_bench.sh` keeps the feed on 127.0.0.1 (override with `IFACE=`), passes the
   replayer's `--from` to the consumer, and exits nonzero if either side fails.
+- **`feed_consumer --signals`** (pass it via `CONSUMER_ARGS="--signals"` to
+  `feed_bench.sh`) computes signals live for every symbol and prints the final
+  values for the `--show` symbols (default AAPL,MSFT,QQQ).
+- **`signal_study`** takes `--horizon-ms` (forward-return horizon, default 1000) and
+  `--tau-ms` (decay constant, default 1000) and prints per-symbol and pooled results.
 
 ## Design notes
 
@@ -134,6 +147,25 @@ bash tools/feed_bench.sh ~/itch/01302019.NASDAQ_ITCH50 \
   `--limit`/`--to` exactly and faults the pages in before timing starts.
 - **Clock steps.** Latency samples where the realtime clock visibly stepped
   (negative, or over 10 s) are excluded and counted.
+
+### Stage 4: signals
+
+- **Listener hook.** `BookBuilder<Levels, Listener>` calls the listener after every
+  book update and before each execution changes the book. With the default
+  `NullListener` the hooks compile away; the top-of-book hash is the same with or
+  without a listener.
+- **Signals.** Top-of-book imbalance; microprice, which leans the mid toward the thin
+  side (microprice − mid = spread/2 · imbalance, so their signs agree);
+  Cont–Kukanov–Stoikov order-flow imbalance over each top-of-book change; and signed
+  trade flow. OFI and trade flow are exponentially decayed sums in feed time
+  (τ = 1 s by default).
+- **Exact trade direction.** ITCH executions name the resting order, so the aggressor
+  side is known without a Lee–Ready guess. Hidden-order (`P`) trades are excluded,
+  since their side field has been fixed to `B` since 2014.
+- **Honest evaluation.** Each sample, taken at a top-of-book change during regular
+  hours, is labeled with the direction of the next mid change and the mid return over
+  a fixed horizon. Labels only use later data. Deciles and correlation are computed
+  per symbol before pooling, so share-denominated signals compare fairly across symbols.
 
 ## Results
 
@@ -226,3 +258,55 @@ and receiver share the machine. Kernel timestamps use `CLOCK_REALTIME`, which Hy
 TimeSync steps about every 30 s. Visible steps are excluded, but single `max` values
 (about 5 s in two runs) are clock artifacts, so the tables stop at p99.9/p99.99.
 Percentiles over millions of packets are unaffected.
+
+### Signals
+
+**Throughput cost.** `book_replay`, full day, all symbols, best of 5:
+
+| | Best | Median | Throughput | ns/msg |
+|---|---|---|---|---|
+| books only | 29.29 s | 29.96 s | 12.6 M msgs/s | 79.5 |
+| books + signal engine | 35.58 s | 37.59 s | 10.4 M msgs/s | 96.6 |
+
+Both produce top-of-book hash `fea88aae34305502`. The engine adds ~17 ns/msg
+(~21%) while handling 174,890,436 top-of-book changes and 8,249,299 executions.
+
+**Predictive power.** `signal_study`: AAPL, MSFT, AMZN, GOOGL, FB, NVDA, INTC, CSCO,
+QQQ, TSLA, 09:35–15:55, one sample per top-of-book change, pooled over symbols.
+Hit rate is the share of samples whose sign matches the next mid move (samples with a
+zero signal are skipped); deciles are the mean 1 s forward mid return.
+
+| Signal | samples | hit rate (next move) | corr (1 s fwd) | bottom-decile bps | top-decile bps |
+|---|---|---|---|---|---|
+| imbalance | 5,713,468 | 63.7% | +0.178 | −0.40 | +0.40 |
+| microprice | 5,713,468 | 63.7% | +0.171 | −0.39 | +0.40 |
+| OFI | 5,713,468 | 54.4% | +0.078 | −0.13 | +0.13 |
+| trade flow | 5,713,468 | 53.6% | +0.045 | −0.17 | +0.15 |
+
+- Imbalance's hit rate is 56.6% (GOOGL) to 66.9% (QQQ) per symbol, and its deciles
+  rise monotonically. Microprice matches it exactly, since their signs are identical.
+- OFI's deciles rise through the middle but fall back at the extremes; trade flow's
+  rise steadily but are small.
+- By horizon (the next-move hit rate does not depend on it; correlation does):
+
+| Horizon | imbalance corr | OFI corr | trade flow corr |
+|---|---|---|---|
+| 100 ms | +0.238 | +0.090 | +0.062 |
+| 1 s | +0.178 | +0.078 | +0.045 |
+| 10 s | +0.078 | +0.013 | −0.010 |
+
+  The information is short-lived: OFI and trade flow are essentially gone by 10 s.
+
+**Live path.** Real-time open, 09:29:30–09:35:00 at `--speed 1`, `--batch-ns 10000`,
+4,753,225 packets, 0 gaps and 0 kernel drops in both runs:
+
+| | total p50 | p99 | p99.9 | svc p50 | svc p99 |
+|---|---|---|---|---|---|
+| books only | 2.58 | 14.97 | 42.0 | 0.28 | 1.91 |
+| books + signals | 2.62 | 20.73 | 43.0 | 0.31 | 2.37 |
+
+The engine adds ~0.03 µs at the median and ~0.5 µs at p99 of per-packet service
+time, well below the ~2.5 µs kernel/socket floor.
+
+**Caveat.** One trading day and ten symbols. This is a measurement, not a trading
+strategy: predicting the next mid move is not the same as profiting after the spread.
