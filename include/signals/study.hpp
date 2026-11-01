@@ -31,22 +31,30 @@ struct Sample {
     [[nodiscard]] bool labeled() const noexcept { return next_move != 0 && std::isfinite(fwd_bps); }
 };
 
-// Labels one symbol's samples. Feed it every top-of-book change of that symbol
-// (on_change), and add() a sample right after the change it was taken at.
-// Timestamps must not decrease. Several messages of one event (an order that
-// sweeps many resting orders) share a timestamp and each changes the touch, so
-// the caller samples after each; only the sample after the last of them is a
-// real prediction, and earlier ones at the same timestamp are dropped (their
-// labels would be set by the rest of the same, already-decided event). add()
-// is ignored until the first on_change has set a positive mid.
+// Labels one symbol's samples. Feed it every two-sided top-of-book change of
+// that symbol (on_change), and add() a sample right after the change it was
+// taken at. If the touch changes but is no longer two-sided, call drop_at(ts)
+// instead. Timestamps must not decrease. Several messages of one event (an
+// order that sweeps many resting orders) share a timestamp and each changes the
+// touch, so the caller samples after each; only the sample after the last of
+// them is a real prediction, and earlier ones at the same timestamp are dropped
+// (their labels would be set by the rest of the same, already-decided event).
+// That is why drop_at matters: an event that ends one-sided must not leave an
+// earlier sample of the same event to be labeled by the event's own outcome.
+// add() is ignored until the first on_change has set a positive mid.
 class Labeler {
 public:
     explicit Labeler(std::uint64_t horizon_ns) : horizon_(horizon_ns) {}
 
+    // Drops the still-unlabeled samples taken at ts.
+    // Samples at or past both cursors are unresolved, so dropping them leaves the cursors valid.
+    void drop_at(std::uint64_t ts) {
+        while (s_.size() > std::max(move_from_, horizon_from_) && s_.back().ts == ts) s_.pop_back();
+    }
+
     void on_change(std::uint64_t ts, double new_mid) {
         // Several messages of one event share a timestamp; only the sample taken after the last of them is a real prediction.
-        // Samples at or past both cursors are unresolved, so dropping them leaves the cursors valid.
-        while (s_.size() > std::max(move_from_, horizon_from_) && s_.back().ts == ts) s_.pop_back();
+        drop_at(ts);
         // A change after t + horizon means the mid at t + horizon was the current one.
         while (horizon_from_ < s_.size() && s_[horizon_from_].ts + horizon_ < ts) {
             Sample& s = s_[horizon_from_++];

@@ -5,6 +5,7 @@
 //
 //   feed_consumer [--group A] [--port P] [--iface A] [--rcvbuf BYTES] [--cpu N]
 //                 [--from HH:MM:SS] [--start-timeout SECONDS] [--idle-timeout SECONDS]
+//                 [--signals] [--show SYM,...]
 //
 // Latency is reported in two parts plus the total, and the service time:
 //   queue = recvmmsg() returned - kernel receive    (waiting in the socket buffer)
@@ -17,6 +18,12 @@
 // where the realtime clock visibly stepped (backwards, or total > 10 s) are
 // counted as clock steps and left out. The forward cutoff is 10 s: a 256 MB
 // receive buffer can legitimately hold a backlog of more than 1 s.
+// --signals attaches the signal engine (all symbols), so its cost lands in the
+// book and svc histograms; --show lists symbols whose final signals are printed
+// (default AAPL,MSFT,QQQ) and implies --signals. Without --signals the listener
+// still costs a null check per book update, an extra order lookup per execution
+// and a timestamp store per message, so that mode is not byte-identical to the
+// Stage 3 consumer.
 // Exits 1 if no datagram arrives within --start-timeout of joining (default
 // 30 s); after the first one, --idle-timeout (default 5 s) of silence ends the
 // run. Exits nonzero on any gap, malformed or truncated packet, packet without a
@@ -24,18 +31,23 @@
 // packet arrives.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
-#include <exception>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
 
 #include "book/book_builder.hpp"
 #include "cli.hpp"
 #include "net/feed_handler.hpp"
 #include "net/os.hpp"
 #include "net/udp.hpp"
+#include "signals/signal_engine.hpp"
 #include "stats/histogram.hpp"
 
 namespace {
@@ -48,16 +60,36 @@ void print_hist(const char* name, const stats::Histogram& h) {
                 h.mean() / 1e3);
 }
 
+// Book listener that forwards to the signal engine only when one is attached.
+struct MaybeSignals {
+    signals::SignalEngine* engine = nullptr;
+
+    template <class B>
+    void on_book_update(std::uint16_t locate, std::uint64_t ts, const B& b) {
+        if (engine) engine->on_book_update(locate, ts, b);
+    }
+    void on_execution(std::uint16_t locate, std::uint64_t ts, char side, std::uint32_t shares, std::uint32_t price) {
+        if (engine) engine->on_execution(locate, ts, side, shares, price);
+    }
+};
+
 }  // namespace
 
 int run(int argc, char** argv) {
     net::McastAddr addr;
     int rcvbuf = 256 << 20, cpu = -1;
     std::uint64_t from = 0;
+    bool with_signals = false;
+    std::vector<std::string> show;
     double idle_s = 5, start_s = 30;
     for (int i = 1; i < argc; ++i) {
         auto opt = [&](const char* name) { return !std::strcmp(argv[i], name) && i + 1 < argc; };
-        if (opt("--group")) addr.group = argv[++i];
+        if (!std::strcmp(argv[i], "--signals")) {
+            with_signals = true;
+        } else if (opt("--show")) {
+            std::stringstream ss(argv[++i]);
+            for (std::string s; std::getline(ss, s, ',');) show.push_back(s);
+        } else if (opt("--group")) addr.group = argv[++i];
         else if (opt("--port")) addr.port = static_cast<std::uint16_t>(std::atoi(argv[++i]));
         else if (opt("--iface")) addr.iface = argv[++i];
         else if (opt("--rcvbuf")) rcvbuf = std::atoi(argv[++i]);
@@ -70,6 +102,7 @@ int run(int argc, char** argv) {
             return 2;
         }
     }
+    if (!show.empty()) with_signals = true;
     if (cpu >= 0 && !net::pin_to_cpu(cpu)) std::perror("pin_to_cpu");
 
     int granted = 0;
@@ -78,7 +111,11 @@ int run(int argc, char** argv) {
                 granted / 2 < rcvbuf ? "  (capped by net.core.rmem_max)" : "");
     std::fflush(stdout);
 
-    auto books = std::make_unique<book::BookBuilder<book::VectorLevels>>();
+    std::unique_ptr<signals::SignalEngine> engine;
+    if (with_signals) engine = std::make_unique<signals::SignalEngine>();
+    if (show.empty()) show = {"AAPL", "MSFT", "QQQ"};
+    auto books = std::make_unique<book::BookBuilder<book::VectorLevels, MaybeSignals>>(
+        22, std::vector<std::uint64_t>{}, MaybeSignals{engine.get()});
     net::FeedHandler feed(*books);
     auto batch = std::make_unique<net::RecvBatch<64, 2048>>();
     auto h_total = std::make_unique<stats::Histogram>();
@@ -174,6 +211,25 @@ int run(int argc, char** argv) {
     std::printf("  crossed open %llu  locked open %llu  crossed pre/post/halt %llu (allowed)\n",
                 (unsigned long long)v.crossed_open, (unsigned long long)v.locked_open,
                 (unsigned long long)v.crossed_other);
+
+    if (engine) {
+        std::printf("\nsignals (tau %.0f ms, as of the last message)\n", engine->tau_ns() / 1e6);
+        for (const std::string& sym : show) {
+            const int loc = books->locate_of(sym);
+            if (loc < 0) {
+                std::printf("  %-6s not in directory\n", sym.c_str());
+                continue;
+            }
+            const auto l = static_cast<std::uint16_t>(loc);
+            const book::Bbo& q = engine->bbo(l);
+            const signals::Snapshot x = engine->snapshot(l, engine->last_ts());
+            auto r0 = [](double v) { return std::fabs(v) < 0.5 ? 0.0 : v; };
+            std::printf("  %-6s %9.4f x %-9.4f  imbalance %+.3f  micro %+.2f bps  ofi %+.0f  flow %+.0f  "
+                        "(%llu bbo changes, %llu executions)\n",
+                        sym.c_str(), q.bid / 1e4, q.ask / 1e4, x.imbalance, x.micro_bps, r0(x.ofi), r0(x.flow),
+                        (unsigned long long)engine->bbo_changes(l), (unsigned long long)engine->executions(l));
+        }
+    }
 
     std::printf("\ntick-to-book latency per packet (us)\n");
     print_hist("total", *h_total);
