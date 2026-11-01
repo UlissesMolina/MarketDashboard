@@ -20,6 +20,7 @@ $CXX "${COMMON[@]}" "${RELEASE[@]}" tools/itch_profile.cpp -o build/itch_profile
 $CXX "${COMMON[@]}" "${RELEASE[@]}" tools/book_replay.cpp -o build/book_replay
 $CXX "${COMMON[@]}" "${RELEASE[@]}" tools/feed_replayer.cpp -o build/feed_replayer
 $CXX "${COMMON[@]}" "${RELEASE[@]}" tools/feed_consumer.cpp -o build/feed_consumer
+$CXX "${COMMON[@]}" "${RELEASE[@]}" tools/signal_study.cpp -o build/signal_study
 
 if [[ "${1:-}" == "test" ]]; then
     ./build/test_parser

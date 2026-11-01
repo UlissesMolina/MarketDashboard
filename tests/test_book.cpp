@@ -271,6 +271,10 @@ Wire listener_feed() {
     w.header('E', kLoc, 0, 600).be(9, 8).be(10, 4).be(4, 8).end();                         // unknown ref
     w.header('E', kLoc + 1, 0, 650).be(2, 8).be(5, 4).be(5, 8).end();                      // wrong locate
     w.header('X', kLoc, 0, 700).be(2, 8).be(10, 4).end();                                  // cancel: not an exec
+    w.header('F', kLoc, 0, 800).be(10, 8).ch('B').be(25, 4).str("TEST", 8).be(9'990, 4).str("MPID", 4).end();
+    w.header('U', kLoc, 0, 900).be(2, 8).be(11, 8).be(15, 4).be(10'105, 4).end();          // replace: one update
+    w.header('D', kLoc, 0, 1000).be(10, 8).end();
+    w.header('C', kLoc, 0, 1100).be(11, 8).be(5, 4).be(6, 8).ch('N').be(10'105, 4).end();  // non-printable: book only
     return w;
 }
 
@@ -281,15 +285,20 @@ void test_listener_sees_updates_and_executions() {
     itch::parse(w.data(), w.data_end(), b);
     const Recorder& r = b.listener();
 
-    // One update per book change: 2 adds, 3 executions, 1 cancel. Unknown ref and
-    // wrong locate change nothing and report nothing.
-    CHECK(r.updates.size() == 6);
-    if (r.updates.size() == 6) {
-        const std::uint64_t ts[] = {100, 200, 300, 400, 500, 700};
-        for (std::size_t i = 0; i < 6; ++i) CHECK(r.updates[i].ts == ts[i] && r.updates[i].locate == kLoc);
+    // One update per book change: 3 adds (A, A, F), 3 executions, 1 cancel, 1 replace,
+    // 1 delete, 1 non-printable execution. Unknown ref and wrong locate change nothing
+    // and report nothing.
+    CHECK(r.updates.size() == 10);
+    if (r.updates.size() == 10) {
+        const std::uint64_t ts[] = {100, 200, 300, 400, 500, 700, 800, 900, 1000, 1100};
+        for (std::size_t i = 0; i < 10; ++i) CHECK(r.updates[i].ts == ts[i] && r.updates[i].locate == kLoc);
         CHECK(r.updates[2].bbo.bid == 10'000 && r.updates[2].bbo.bid_shares == 70);
         CHECK(r.updates[4].bbo.bid == 0);  // order 1 fully executed
         CHECK(r.updates[5].bbo.ask == 10'100 && r.updates[5].bbo.ask_shares == 20);
+        CHECK(r.updates[6].bbo == (book::Bbo{9'990, 10'100, 25, 20}));    // F: new best bid
+        CHECK(r.updates[7].bbo == (book::Bbo{9'990, 10'105, 25, 15}));    // U: ask moves, single update
+        CHECK(r.updates[8].bbo == (book::Bbo{0, 10'105, 0, 15}));         // D: bid gone
+        CHECK(r.updates[9].bbo == (book::Bbo{0, 10'105, 0, 10}));         // C 'N': book changes
     }
 
     CHECK(r.execs.size() == 3);
