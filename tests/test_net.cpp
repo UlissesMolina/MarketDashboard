@@ -9,6 +9,9 @@
 #include <string_view>
 #include <vector>
 
+#include "book/book_builder.hpp"
+#include "itch/parser.hpp"
+#include "net/feed_handler.hpp"
 #include "net/mold.hpp"
 #include "net/seq_tracker.hpp"
 #include "stats/histogram.hpp"
@@ -191,6 +194,126 @@ void test_seq_heartbeat_end_and_session() {
     CHECK(t.ended() && t.stats().gaps == 1);
 }
 
+using Book = book::BookBuilder<book::VectorLevels>;
+using Packet = std::vector<unsigned char>;
+
+// 20 adds (alternating sides, never crossing), 20 partial executions, 20 deletes.
+Wire feed_messages() {
+    Wire w;
+    for (std::uint64_t i = 1; i <= 20; ++i)
+        add(w, i, i % 2 ? 'B' : 'S', i % 2 ? static_cast<std::uint32_t>(1000 - i) : static_cast<std::uint32_t>(2000 + i), i);
+    for (std::uint64_t i = 1; i <= 20; ++i) w.header('E', kLoc, 0, 100 + i).be(i, 8).be(40, 4).be(i, 8).end();
+    for (std::uint64_t i = 1; i <= 20; ++i) w.header('D', kLoc, 0, 200 + i).be(i, 8).end();
+    return w;
+}
+
+Packet packet(std::string_view session, std::uint64_t seq, std::uint16_t count,
+              const unsigned char* body = nullptr, std::size_t bytes = 0) {
+    const net::MoldHeader h = net::make_mold_header(session, seq, count);
+    const auto* hp = reinterpret_cast<const unsigned char*>(&h);
+    Packet out(hp, hp + sizeof h);
+    if (bytes) out.insert(out.end(), body, body + bytes);
+    return out;
+}
+
+std::vector<Packet> packetize(const unsigned char* p, const unsigned char* end, std::size_t max_payload,
+                              std::uint64_t seq = 1) {
+    std::vector<Packet> pkts;
+    for (;;) {
+        const net::Span s = net::next_span(p, end, max_payload, ~0ULL, ~0ULL);
+        if (s.count == 0) break;
+        pkts.push_back(packet("TEST", seq, s.count, s.begin, s.bytes));
+        seq += s.count;
+        p += s.bytes;
+    }
+    return pkts;
+}
+
+std::uint64_t reference_hash(const Wire& w) {
+    Book b(8);
+    itch::parse(w.data(), w.data_end(), b);
+    return b.tob_hash();
+}
+
+void test_feed_in_order_matches_direct_parse() {
+    const Wire w = feed_messages();
+    const auto pkts = packetize(w.data(), w.data_end(), 80);
+    CHECK(pkts.size() > 20);
+    Book b(8);
+    net::FeedHandler f(b);
+    std::uint64_t msgs = 0;
+    for (std::size_t i = 0; i < pkts.size(); ++i) {
+        const auto r = f.on_packet(pkts[i].data(), pkts[i].size());
+        CHECK(r.kind == net::PacketKind::data);
+        if (i == 0) CHECK(r.first_ts == 1);
+        msgs += r.messages;
+    }
+    CHECK(msgs == 60);
+    CHECK(f.seq_stats().messages == 60 && f.seq_stats().gaps == 0);
+    CHECK(f.malformed() == 0);
+    CHECK(b.violations().hard() == 0);
+    CHECK(b.tob_hash() == reference_hash(w));
+}
+
+void test_feed_duplicates_are_ignored() {
+    const Wire w = feed_messages();
+    const auto pkts = packetize(w.data(), w.data_end(), 80);
+    Book b(8);
+    net::FeedHandler f(b);
+    for (const auto& p : pkts) {
+        f.on_packet(p.data(), p.size());
+        CHECK(f.on_packet(p.data(), p.size()).kind == net::PacketKind::stale);
+    }
+    CHECK(f.seq_stats().stale_packets == pkts.size());
+    CHECK(b.tob_hash() == reference_hash(w));
+}
+
+void test_feed_drop_is_a_gap() {
+    const Wire w = feed_messages();
+    const auto pkts = packetize(w.data(), w.data_end(), 80);
+    Book b(8);
+    net::FeedHandler f(b);
+    for (std::size_t i = 0; i < pkts.size(); ++i)
+        if (i != 1) f.on_packet(pkts[i].data(), pkts[i].size());  // packet 1 holds adds 3 and 4
+    CHECK(f.seq_stats().gaps == 1 && f.seq_stats().lost_messages == 2);
+    CHECK(b.violations().unknown_ref > 0);  // later exec/delete of refs 3 and 4
+    CHECK(b.tob_hash() != reference_hash(w));
+}
+
+void test_feed_partial_overlap() {
+    const Wire w = feed_messages();
+    const net::Span two = net::next_span(w.data(), w.data_end(), 1400, ~0ULL, 2);
+    const net::Span four = net::next_span(w.data(), w.data_end(), 1400, ~0ULL, 4);
+    Book b(8);
+    net::FeedHandler f(b);
+    const Packet p2 = packet("TEST", 1, 2, two.begin, two.bytes);
+    const Packet p4 = packet("TEST", 1, 4, four.begin, four.bytes);
+    CHECK(f.on_packet(p2.data(), p2.size()).messages == 2);
+    const auto r = f.on_packet(p4.data(), p4.size());
+    CHECK(r.kind == net::PacketKind::data && r.messages == 2 && r.first_ts == 3);
+    for (const auto& p : packetize(w.data() + four.bytes, w.data_end(), 80, 5)) f.on_packet(p.data(), p.size());
+    CHECK(f.seq_stats().messages == 60 && f.malformed() == 0);
+    CHECK(b.tob_hash() == reference_hash(w));
+}
+
+void test_feed_control_and_malformed() {
+    Wire w;
+    add(w, 1, 'B', 100, 1);
+    Book b(8);
+    net::FeedHandler f(b);
+    const Packet hb = packet("TEST", 1, net::kHeartbeat);
+    CHECK(f.on_packet(hb.data(), hb.size()).kind == net::PacketKind::heartbeat);
+    const Packet other = packet("OTHER", 1, net::kHeartbeat);
+    CHECK(f.on_packet(other.data(), other.size()).kind == net::PacketKind::wrong_session);
+    CHECK(f.on_packet(hb.data(), 10).kind == net::PacketKind::malformed);  // shorter than a header
+    const Packet lying = packet("TEST", 1, 5, w.data(), 38);  // claims 5 messages, carries 1
+    CHECK(f.on_packet(lying.data(), lying.size()).kind == net::PacketKind::data);
+    CHECK(f.malformed() == 2);
+    const Packet eos = packet("TEST", 6, net::kEndOfSession);
+    CHECK(f.on_packet(eos.data(), eos.size()).kind == net::PacketKind::end_of_session);
+    CHECK(f.ended() && f.seq_stats().gaps == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -206,6 +329,11 @@ int main() {
     test_seq_in_order_and_gap();
     test_seq_stale_and_partial_overlap();
     test_seq_heartbeat_end_and_session();
+    test_feed_in_order_matches_direct_parse();
+    test_feed_duplicates_are_ignored();
+    test_feed_drop_is_a_gap();
+    test_feed_partial_overlap();
+    test_feed_control_and_malformed();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;
