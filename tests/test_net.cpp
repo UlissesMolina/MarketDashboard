@@ -101,6 +101,51 @@ void test_skip_messages() {
     CHECK(net::skip_messages(w.data(), w.data_end() - 1, 3) == nullptr);  // truncated last block
 }
 
+void test_next_span_payload_limit() {
+    Wire w;
+    add(w, 1, 'B', 100, 1);
+    add(w, 2, 'B', 100, 2);
+    add(w, 3, 'B', 100, 3);
+    net::Span s = net::next_span(w.data(), w.data_end(), 80, ~0ULL, ~0ULL);
+    CHECK(s.begin == w.data() && s.count == 2 && s.bytes == 76 && s.first_ts == 1);
+    s = net::next_span(w.data() + s.bytes, w.data_end(), 80, ~0ULL, ~0ULL);
+    CHECK(s.count == 1 && s.bytes == 38 && s.first_ts == 3);
+    s = net::next_span(w.data_end(), w.data_end(), 80, ~0ULL, ~0ULL);
+    CHECK(s.count == 0 && s.bytes == 0);
+}
+
+void test_next_span_takes_at_least_one() {
+    Wire w;
+    add(w, 1, 'B', 100, 1);
+    const net::Span s = net::next_span(w.data(), w.data_end(), 10, ~0ULL, ~0ULL);
+    CHECK(s.count == 1 && s.bytes == 38);
+}
+
+void test_next_span_time_window_and_count() {
+    Wire w;
+    add(w, 1, 'B', 100, 100);
+    add(w, 2, 'B', 100, 100);
+    add(w, 3, 'B', 100, 150);
+    add(w, 4, 'B', 100, 400);
+    net::Span s = net::next_span(w.data(), w.data_end(), 1400, 100, ~0ULL);
+    CHECK(s.count == 3);  // 150 - 100 <= 100, 400 - 100 > 100
+    s = net::next_span(w.data(), w.data_end(), 1400, 0, ~0ULL);
+    CHECK(s.count == 2);  // window 0: identical timestamps only
+    s = net::next_span(w.data(), w.data_end(), 1400, ~0ULL, 3);
+    CHECK(s.count == 3);  // max_count
+}
+
+void test_next_span_truncated() {
+    Wire w;
+    add(w, 1, 'B', 100, 1);
+    add(w, 2, 'B', 100, 2);
+    const unsigned char* end = w.data_end() - 1;
+    net::Span s = net::next_span(w.data(), end, 1400, ~0ULL, ~0ULL);
+    CHECK(s.count == 1);
+    s = net::next_span(w.data() + s.bytes, end, 1400, ~0ULL, ~0ULL);
+    CHECK(s.count == 0);  // caller sees count 0 with p != end: framing error
+}
+
 }  // namespace
 
 int main() {
@@ -109,6 +154,10 @@ int main() {
     test_histogram_tail();
     test_mold_header_layout();
     test_skip_messages();
+    test_next_span_payload_limit();
+    test_next_span_takes_at_least_one();
+    test_next_span_time_window_and_count();
+    test_next_span_truncated();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

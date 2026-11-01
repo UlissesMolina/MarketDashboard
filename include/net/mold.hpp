@@ -60,4 +60,38 @@ inline void put_be(unsigned char* p, std::uint64_t v, int n) noexcept {
     return p;
 }
 
+// One packet's worth of message blocks.
+struct Span {
+    const unsigned char* begin;  // first message block
+    std::size_t bytes;           // message-block bytes
+    std::uint16_t count;         // messages
+    std::uint64_t first_ts;      // ITCH timestamp of the first message
+};
+
+// Takes whole message blocks from [p, end) for one packet: as many as fit in
+// max_payload bytes, at most max_count, and only while each message's timestamp
+// is within max_span_ns of the first one. A paced replay passes 0 so it never
+// holds a message back to batch it with a later event. Always takes one message
+// if a complete one is available. Returns count == 0 at end of input or when the
+// framing at p is truncated.
+[[nodiscard]] inline Span next_span(const unsigned char* p, const unsigned char* end, std::size_t max_payload,
+                                    std::uint64_t max_span_ns, std::uint64_t max_count) noexcept {
+    Span s{p, 0, 0, 0};
+    const unsigned char* q = p;
+    while (s.count < max_count && s.count < kEndOfSession - 1 && end - q >= 2) {
+        const std::size_t len = itch::load_be16(q);
+        if (len < sizeof(itch::Header) || static_cast<std::size_t>(end - q) - 2 < len) break;
+        const std::uint64_t ts = reinterpret_cast<const itch::Header*>(q + 2)->timestamp;
+        if (s.count == 0) {
+            s.first_ts = ts;
+        } else if (s.bytes + 2 + len > max_payload || ts - s.first_ts > max_span_ns) {
+            break;
+        }
+        s.bytes += 2 + len;
+        ++s.count;
+        q += 2 + len;
+    }
+    return s;
+}
+
 }  // namespace net
