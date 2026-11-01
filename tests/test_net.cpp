@@ -4,9 +4,14 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <initializer_list>
+#include <string_view>
+#include <vector>
 
+#include "net/mold.hpp"
 #include "stats/histogram.hpp"
+#include "wire.hpp"
 
 namespace {
 
@@ -19,6 +24,13 @@ int failures = 0;
             ++failures;                                                               \
         }                                                                             \
     } while (0)
+
+using test::Wire;
+constexpr std::uint16_t kLoc = 1;
+
+void add(Wire& w, std::uint64_t ref, char side, std::uint32_t price, std::uint64_t ts) {
+    w.header('A', kLoc, 0, ts).be(ref, 8).ch(side).be(100, 4).str("TEST", 8).be(price, 4).end();
+}
 
 void test_histogram_exact_below_128() {
     stats::Histogram h;
@@ -49,6 +61,13 @@ void test_histogram_bucket_bounds() {
         }
         prev = i;
     }
+    for (std::size_t i = 0; i < H::kBuckets; ++i) {
+        const bool lo_ok = H::index(H::lower_bound(i)) == i;
+        const bool hi_ok = i + 1 >= H::kBuckets || H::index(H::upper_bound(i)) == i;
+        CHECK(lo_ok);
+        CHECK(hi_ok);
+        if (!lo_ok || !hi_ok) return;
+    }
 }
 
 void test_histogram_tail() {
@@ -56,12 +75,81 @@ void test_histogram_tail() {
     for (int i = 0; i < 990; ++i) h.record(10'000);   // 10 us body
     for (int i = 0; i < 10; ++i) h.record(5'000'000); // 5 ms tail
     const std::uint64_t p50 = h.percentile(0.5);
-    CHECK(p50 <= 10'000 && p50 >= 10'000 - 10'000 / 128);
-    CHECK(h.percentile(0.95) <= 10'000);
+    CHECK(p50 >= 10'000 && p50 <= 10'000 + 10'000 / 128);
+    CHECK(h.percentile(0.95) <= 10'000 + 10'000 / 128);
     const std::uint64_t p999 = h.percentile(0.999);
-    CHECK(p999 <= 5'000'000 && p999 >= 5'000'000 - 5'000'000 / 128);
+    CHECK(p999 == 5'000'000);
     CHECK(h.max() == 5'000'000);
     CHECK(stats::Histogram{}.percentile(0.5) == 0);
+}
+
+void test_mold_header_layout() {
+    const net::MoldHeader h = net::make_mold_header("ITCH", 0x0102030405060708ULL, 3);
+    unsigned char raw[sizeof h];
+    std::memcpy(raw, &h, sizeof h);
+    CHECK(std::memcmp(raw, "ITCH      ", 10) == 0);
+    for (int i = 0; i < 8; ++i) CHECK(raw[10 + i] == i + 1);
+    CHECK(raw[18] == 0 && raw[19] == 3);
+    CHECK(h.sequence.get() == 0x0102030405060708ULL);
+    CHECK(h.count.get() == 3);
+    CHECK(net::session_of(h) == "ITCH      ");
+}
+
+void test_skip_messages() {
+    Wire w;
+    add(w, 1, 'B', 100, 1);
+    add(w, 2, 'B', 100, 2);
+    add(w, 3, 'B', 100, 3);
+    CHECK(net::skip_messages(w.data(), w.data_end(), 0) == w.data());
+    CHECK(net::skip_messages(w.data(), w.data_end(), 2) == w.data() + 2 * 38);  // 'A' is 36 bytes + 2 length
+    CHECK(net::skip_messages(w.data(), w.data_end(), 3) == w.data_end());
+    CHECK(net::skip_messages(w.data(), w.data_end(), 4) == nullptr);
+    CHECK(net::skip_messages(w.data(), w.data_end() - 1, 3) == nullptr);  // truncated last block
+}
+
+void test_next_span_payload_limit() {
+    Wire w;
+    add(w, 1, 'B', 100, 1);
+    add(w, 2, 'B', 100, 2);
+    add(w, 3, 'B', 100, 3);
+    net::Span s = net::next_span(w.data(), w.data_end(), 80, ~0ULL, ~0ULL);
+    CHECK(s.begin == w.data() && s.count == 2 && s.bytes == 76 && s.first_ts == 1);
+    s = net::next_span(w.data() + s.bytes, w.data_end(), 80, ~0ULL, ~0ULL);
+    CHECK(s.count == 1 && s.bytes == 38 && s.first_ts == 3);
+    s = net::next_span(w.data_end(), w.data_end(), 80, ~0ULL, ~0ULL);
+    CHECK(s.count == 0 && s.bytes == 0);
+}
+
+void test_next_span_takes_at_least_one() {
+    Wire w;
+    add(w, 1, 'B', 100, 1);
+    const net::Span s = net::next_span(w.data(), w.data_end(), 10, ~0ULL, ~0ULL);
+    CHECK(s.count == 1 && s.bytes == 38);
+}
+
+void test_next_span_time_window_and_count() {
+    Wire w;
+    add(w, 1, 'B', 100, 100);
+    add(w, 2, 'B', 100, 100);
+    add(w, 3, 'B', 100, 150);
+    add(w, 4, 'B', 100, 400);
+    net::Span s = net::next_span(w.data(), w.data_end(), 1400, 100, ~0ULL);
+    CHECK(s.count == 3);  // 150 - 100 <= 100, 400 - 100 > 100
+    s = net::next_span(w.data(), w.data_end(), 1400, 0, ~0ULL);
+    CHECK(s.count == 2);  // window 0: identical timestamps only
+    s = net::next_span(w.data(), w.data_end(), 1400, ~0ULL, 3);
+    CHECK(s.count == 3);  // max_count
+}
+
+void test_next_span_truncated() {
+    Wire w;
+    add(w, 1, 'B', 100, 1);
+    add(w, 2, 'B', 100, 2);
+    const unsigned char* end = w.data_end() - 1;
+    net::Span s = net::next_span(w.data(), end, 1400, ~0ULL, ~0ULL);
+    CHECK(s.count == 1);
+    s = net::next_span(w.data() + s.bytes, end, 1400, ~0ULL, ~0ULL);
+    CHECK(s.count == 0);  // caller sees count 0 with p != end: framing error
 }
 
 }  // namespace
@@ -70,6 +158,12 @@ int main() {
     test_histogram_exact_below_128();
     test_histogram_bucket_bounds();
     test_histogram_tail();
+    test_mold_header_layout();
+    test_skip_messages();
+    test_next_span_payload_limit();
+    test_next_span_takes_at_least_one();
+    test_next_span_time_window_and_count();
+    test_next_span_truncated();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

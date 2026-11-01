@@ -1,8 +1,8 @@
 #pragma once
 
-// Log-linear latency histogram (HdrHistogram-style). Values below 128 are
+// Log-linear latency histogram (HdrHistogram-style). Values below 256 are
 // counted exactly. Above that, each power of two is split into 128 buckets, so a
-// reported percentile is at most 1/128 (0.8%) below the true value. Fixed size
+// reported percentile is at most 1/128 (0.8%) above the true value. Fixed size
 // (~58 KB) and no allocation in record(), so it can sit on the hot path.
 
 #include <algorithm>
@@ -35,9 +35,10 @@ public:
     [[nodiscard]] double mean() const noexcept { return count_ ? double(sum_) / double(count_) : 0.0; }
 
     // Value at or below which a fraction p of samples fall, to bucket precision
-    // (the bucket's lower bound, clamped to [min, max]). p >= 1 returns the exact max.
+    // (the bucket's upper bound, clamped to [min, max]). p >= 1 returns the exact max.
     [[nodiscard]] std::uint64_t percentile(double p) const noexcept {
         if (count_ == 0) return 0;
+        if (p <= 0.0) return min_;
         if (p >= 1.0) return max_;
         // The epsilon keeps p * count from rounding up past an exact rank (0.99 * 100).
         const auto rank = std::max<std::uint64_t>(
@@ -45,7 +46,7 @@ public:
         std::uint64_t seen = 0;
         for (std::size_t i = 0; i < kBuckets; ++i) {
             seen += counts_[i];
-            if (seen >= rank) return std::clamp(lower_bound(i), min_, max_);
+            if (seen >= rank) return std::clamp(upper_bound(i), min_, max_);
         }
         return max_;
     }
@@ -60,6 +61,10 @@ public:
         if (i < kSub) return i;
         const int shift = static_cast<int>(i / kSub) - 1;
         return (static_cast<std::uint64_t>(i % kSub) + kSub) << shift;
+    }
+
+    static constexpr std::uint64_t upper_bound(std::size_t i) noexcept {
+        return i + 1 < kBuckets ? lower_bound(i + 1) - 1 : std::numeric_limits<std::uint64_t>::max();
     }
 
 private:
