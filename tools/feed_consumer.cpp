@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <exception>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -48,7 +49,7 @@ void print_hist(const char* name, const stats::Histogram& h) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int run(int argc, char** argv) {
     net::McastAddr addr;
     int rcvbuf = 256 << 20, cpu = -1;
     std::uint64_t from = 0;
@@ -181,4 +182,13 @@ int main(int argc, char** argv) {
     const bool ok = feed.ended() && s.gaps == 0 && feed.malformed() == 0 && truncated == 0 && missing_ts == 0 &&
                     v.hard() == 0;
     return ok ? 0 : 1;
+}
+
+int main(int argc, char** argv) {
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "error: %s\n", e.what());
+        return 1;
+    }
 }

@@ -9,15 +9,19 @@
 // Pacing. --rate is a ceiling on the message rate (default 5e6; 0 = unlimited),
 // enforced by a token bucket: after a stall the sender catches up by at most
 // --max-burst-us worth of messages (default 50 us), then continues at --rate
-// instead of blasting until it is back on the original schedule.
-// With --speed X, each packet whose first message is at or after --from is also
-// held until its ITCH timestamp, scaled by 1/X and measured from the first such
-// packet, so bursts keep their real shape. Those packets only batch messages
-// with identical timestamps. A packet sent more than 1 ms behind that schedule
-// moves the schedule forward by its lateness (a re-base), so later bursts keep
-// their real spacing instead of being compressed. Messages before --from go out
-// at the --rate cap, which builds the books up to that time. Lateness (send time
-// minus due time) is reported as a distribution. Sends end-of-session at the end.
+// instead of blasting until it is back on the original schedule. The ceiling
+// applies to unpaced packets only: all packets without --speed, and the catch-up
+// before --from with it.
+// With --speed X, each packet whose first message is at or after --from is held
+// until its ITCH timestamp, scaled by 1/X and measured from the first such
+// packet, so bursts keep their real shape. Paced packets follow timestamps only
+// (no --rate cap) and only batch messages with identical timestamps. A packet
+// sent more than 1 ms behind that schedule moves the schedule forward by its
+// lateness (a re-base), so later bursts keep their real spacing instead of being
+// compressed. Messages before --from go out at the --rate cap, which builds the
+// books up to that time. Lateness (send time minus due time) is reported as a
+// distribution: paced packets only with --speed, all packets otherwise. Sends
+// end-of-session at the end.
 
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -28,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <string>
 
@@ -47,7 +52,7 @@ void spin_until(std::uint64_t t) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int run(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: %s <itch-file> [--group A] [--port P] [--iface A] [--session S] [--rate N] "
@@ -147,7 +152,7 @@ int main(int argc, char** argv) {
 
         const std::uint64_t now0 = net::monotonic_ns();
         std::uint64_t due = now0;
-        if (rate > 0) {
+        if (!paced && rate > 0) {
             next_rate = std::max(next_rate, double(now0) - max_burst_ns);  // bounded catch-up
             due = static_cast<std::uint64_t>(next_rate);
         }
@@ -160,13 +165,15 @@ int main(int argc, char** argv) {
             }
             const std::uint64_t dts = s.first_ts > anchor_ts ? s.first_ts - anchor_ts : 0;
             ts_due = anchor_wall + static_cast<std::uint64_t>(double(dts) / speed);
-            due = std::max(due, ts_due);
+            due = ts_due;
         }
         std::uint64_t now = now0;
         while (now < due) now = net::monotonic_ns();
         const std::uint64_t late = now - due;
-        h_late->record(late);
-        if (late > 50'000) ++late_50us;
+        if (paced || speed == 0) {
+            h_late->record(late);
+            if (late > 50'000) ++late_50us;
+        }
         if (paced && now - ts_due > 1'000'000) {  // far behind: move the schedule, keep later spacing
             anchor_wall += now - ts_due;
             ++rebases;
@@ -178,7 +185,7 @@ int main(int argc, char** argv) {
         mh.msg_iov = iov;
         mh.msg_iovlen = 2;
         if (::sendmsg(sock.fd(), &mh, 0) < 0 && send_errors++ == 0) std::perror("sendmsg");
-        next_rate += double(s.count) * ns_per_msg;
+        if (!paced) next_rate += double(s.count) * ns_per_msg;
 
         seq += s.count;
         msgs += s.count;
@@ -201,10 +208,19 @@ int main(int argc, char** argv) {
     std::printf("elapsed:           %.3f s   %.2f M msgs/s   %.0f k packets/s\n", secs, double(msgs) / secs / 1e6,
                 double(packets) / secs / 1e3);
     auto us = [](std::uint64_t ns) { return double(ns) / 1e3; };
-    std::printf("send lateness us:  p50 %.2f  p99 %.2f  p99.9 %.2f  max %.2f   >50us %llu   re-bases %llu\n",
-                us(h_late->percentile(0.5)), us(h_late->percentile(0.99)), us(h_late->percentile(0.999)),
+    std::printf("send lateness us (%s):  p50 %.2f  p99 %.2f  p99.9 %.2f  max %.2f   >50us %llu   re-bases %llu\n",
+                speed > 0 ? "paced" : "all", us(h_late->percentile(0.5)), us(h_late->percentile(0.99)), us(h_late->percentile(0.999)),
                 us(h_late->max()), (unsigned long long)late_50us, (unsigned long long)rebases);
     std::printf("next sequence:     %llu   send errors: %llu%s\n", (unsigned long long)seq,
                 (unsigned long long)send_errors, framing_error ? "   FRAMING ERROR in file" : "");
     return (send_errors == 0 && !framing_error) ? 0 : 1;
+}
+
+int main(int argc, char** argv) {
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "error: %s\n", e.what());
+        return 1;
+    }
 }
