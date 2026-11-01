@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "net/mold.hpp"
+#include "net/seq_tracker.hpp"
 #include "stats/histogram.hpp"
 #include "wire.hpp"
 
@@ -152,6 +153,44 @@ void test_next_span_truncated() {
     CHECK(s.count == 0);  // caller sees count 0 with p != end: framing error
 }
 
+net::SeqDecision on(net::SeqTracker& t, std::uint64_t seq, std::uint16_t count, std::string_view session = "S") {
+    return t.on_header(net::make_mold_header(session, seq, count));
+}
+
+void test_seq_in_order_and_gap() {
+    net::SeqTracker t;
+    CHECK(on(t, 1, 2).kind == net::PacketKind::data && on(t, 3, 2).skip == 0);
+    CHECK(t.stats().messages == 4 && t.stats().gaps == 0);
+    const net::SeqDecision d = on(t, 8, 1);  // expected 5: 5, 6, 7 lost
+    CHECK(d.kind == net::PacketKind::data && d.skip == 0);
+    CHECK(t.stats().gaps == 1 && t.stats().lost_messages == 3 && t.stats().messages == 5);
+}
+
+void test_seq_stale_and_partial_overlap() {
+    net::SeqTracker t;
+    on(t, 1, 2);
+    on(t, 3, 2);
+    CHECK(on(t, 1, 2).kind == net::PacketKind::stale);
+    CHECK(on(t, 3, 2).kind == net::PacketKind::stale);
+    const net::SeqDecision d = on(t, 4, 3);  // 4 already seen, 5 and 6 new
+    CHECK(d.kind == net::PacketKind::data && d.skip == 1);
+    CHECK(t.stats().stale_packets == 2 && t.stats().messages == 6 && t.stats().gaps == 0);
+}
+
+void test_seq_heartbeat_end_and_session() {
+    net::SeqTracker t;
+    on(t, 1, 2);
+    CHECK(on(t, 3, net::kHeartbeat).kind == net::PacketKind::heartbeat);
+    CHECK(t.stats().gaps == 0);
+    on(t, 5, net::kHeartbeat);  // expected 3: heartbeat reveals 2 lost at the tail
+    CHECK(t.stats().gaps == 1 && t.stats().lost_messages == 2 && t.stats().heartbeats == 2);
+    CHECK(on(t, 5, 1, "OTHER").kind == net::PacketKind::wrong_session);
+    CHECK(t.stats().wrong_session == 1);
+    CHECK(!t.ended());
+    CHECK(on(t, 5, net::kEndOfSession).kind == net::PacketKind::end_of_session);
+    CHECK(t.ended() && t.stats().gaps == 1);
+}
+
 }  // namespace
 
 int main() {
@@ -164,6 +203,9 @@ int main() {
     test_next_span_takes_at_least_one();
     test_next_span_time_window_and_count();
     test_next_span_truncated();
+    test_seq_in_order_and_gap();
+    test_seq_stale_and_partial_overlap();
+    test_seq_heartbeat_end_and_session();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;
