@@ -6,7 +6,13 @@
 #include <cstdio>
 #include <initializer_list>
 
+#include <cstring>
+#include <string_view>
+#include <vector>
+
+#include "net/mold.hpp"
 #include "stats/histogram.hpp"
+#include "wire.hpp"
 
 namespace {
 
@@ -19,6 +25,13 @@ int failures = 0;
             ++failures;                                                               \
         }                                                                             \
     } while (0)
+
+using test::Wire;
+constexpr std::uint16_t kLoc = 1;
+
+void add(Wire& w, std::uint64_t ref, char side, std::uint32_t price, std::uint64_t ts) {
+    w.header('A', kLoc, 0, ts).be(ref, 8).ch(side).be(100, 4).str("TEST", 8).be(price, 4).end();
+}
 
 void test_histogram_exact_below_128() {
     stats::Histogram h;
@@ -64,12 +77,38 @@ void test_histogram_tail() {
     CHECK(stats::Histogram{}.percentile(0.5) == 0);
 }
 
+void test_mold_header_layout() {
+    const net::MoldHeader h = net::make_mold_header("ITCH", 0x0102030405060708ULL, 3);
+    unsigned char raw[sizeof h];
+    std::memcpy(raw, &h, sizeof h);
+    CHECK(std::memcmp(raw, "ITCH      ", 10) == 0);
+    for (int i = 0; i < 8; ++i) CHECK(raw[10 + i] == i + 1);
+    CHECK(raw[18] == 0 && raw[19] == 3);
+    CHECK(h.sequence.get() == 0x0102030405060708ULL);
+    CHECK(h.count.get() == 3);
+    CHECK(net::session_of(h) == "ITCH      ");
+}
+
+void test_skip_messages() {
+    Wire w;
+    add(w, 1, 'B', 100, 1);
+    add(w, 2, 'B', 100, 2);
+    add(w, 3, 'B', 100, 3);
+    CHECK(net::skip_messages(w.data(), w.data_end(), 0) == w.data());
+    CHECK(net::skip_messages(w.data(), w.data_end(), 2) == w.data() + 2 * 38);  // 'A' is 36 bytes + 2 length
+    CHECK(net::skip_messages(w.data(), w.data_end(), 3) == w.data_end());
+    CHECK(net::skip_messages(w.data(), w.data_end(), 4) == nullptr);
+    CHECK(net::skip_messages(w.data(), w.data_end() - 1, 3) == nullptr);  // truncated last block
+}
+
 }  // namespace
 
 int main() {
     test_histogram_exact_below_128();
     test_histogram_bucket_bounds();
     test_histogram_tail();
+    test_mold_header_layout();
+    test_skip_messages();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;
