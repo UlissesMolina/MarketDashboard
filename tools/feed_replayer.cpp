@@ -4,7 +4,7 @@
 //
 //   feed_replayer <file> [--group A] [--port P] [--iface A] [--session S]
 //                 [--rate MSGS_PER_S] [--speed X] [--from HH:MM:SS] [--to HH:MM:SS]
-//                 [--limit N] [--max-payload BYTES] [--max-burst-us US] [--cpu N]
+//                 [--limit N] [--max-payload BYTES] [--max-burst-us US] [--batch-ns N] [--cpu N]
 //
 // Pacing. --rate is a ceiling on the message rate (default 5e6; 0 = unlimited),
 // enforced by a token bucket: after a stall the sender catches up by at most
@@ -15,13 +15,19 @@
 // With --speed X, each packet whose first message is at or after --from is held
 // until its ITCH timestamp, scaled by 1/X and measured from the first such
 // packet, so bursts keep their real shape. Paced packets follow timestamps only
-// (no --rate cap) and only batch messages with identical timestamps. A packet
+// (no --rate cap). A paced packet bundles messages whose timestamps are within
+// --batch-ns of the packet's first message (default 0 = identical timestamps
+// only); those messages go out up to --batch-ns early relative to their own
+// timestamps. Tick-to-book is measured from kernel receive, so the consumer's
+// numbers are unaffected by the bundling. A packet
 // sent more than 1 ms behind that schedule moves the schedule forward by its
 // lateness (a re-base), so later bursts keep their real spacing instead of being
 // compressed. Messages before --from go out at the --rate cap, which builds the
 // books up to that time. Lateness (send time minus due time) is reported as a
-// distribution: paced packets only with --speed, all packets otherwise. Sends
-// end-of-session at the end.
+// distribution: paced packets only with --speed, all packets otherwise. In rate
+// mode, packets whose token bucket was clamped to the --max-burst-us bound are
+// counted as "rate-limited (behind --rate)" and counted in >=50us (>=, so packets
+// clamped at a 50 us burst bound are not hidden). Sends end-of-session at the end.
 
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -57,13 +63,15 @@ int run(int argc, char** argv) {
         std::fprintf(stderr,
                      "usage: %s <itch-file> [--group A] [--port P] [--iface A] [--session S] [--rate N] "
                      "[--speed X] [--from HH:MM:SS] [--to HH:MM:SS] [--limit N] [--max-payload B] "
-                     "[--max-burst-us US] [--cpu N]\n",
+                     "[--max-burst-us US] [--batch-ns N] [--cpu N]\n",
                      argv[0]);
         return 2;
     }
     net::McastAddr addr;
     std::string session = "ITCH50";
     double rate = 5e6, speed = 0, max_burst_us = 50;
+    std::uint64_t batch_ns = 0;
+    bool from_given = false;
     std::uint64_t from = 0, to = ~0ULL, limit = ~0ULL;
     std::size_t max_payload = net::kDefaultMaxPayload;
     int cpu = -1;
@@ -75,11 +83,12 @@ int run(int argc, char** argv) {
         else if (opt("--session")) session = argv[++i];
         else if (opt("--rate")) rate = std::atof(argv[++i]);
         else if (opt("--speed")) speed = std::atof(argv[++i]);
-        else if (opt("--from")) from = cli::parse_hms(argv[++i]);
+        else if (opt("--from")) { from = cli::parse_hms(argv[++i]); from_given = true; }
         else if (opt("--to")) to = cli::parse_hms(argv[++i]);
         else if (opt("--limit")) limit = std::strtoull(argv[++i], nullptr, 10);
         else if (opt("--max-payload")) max_payload = std::strtoull(argv[++i], nullptr, 10);
         else if (opt("--max-burst-us")) max_burst_us = std::atof(argv[++i]);
+        else if (opt("--batch-ns")) batch_ns = std::strtoull(argv[++i], nullptr, 10);
         else if (opt("--cpu")) cpu = std::atoi(argv[++i]);
         else {
             std::fprintf(stderr, "unknown argument: %s\n", argv[i]);
@@ -103,6 +112,13 @@ int run(int argc, char** argv) {
         std::fprintf(stderr, "--max-burst-us must be in [0, 1e9]\n");
         return 2;
     }
+    if (from_given && speed == 0) {
+        std::fprintf(stderr, "warning: --from has no effect on the replay without --speed\n");
+    }
+    if (speed > 0 && to <= from) {
+        std::fprintf(stderr, "--to must be after --from\n");
+        return 2;
+    }
     if (cpu >= 0 && !net::pin_to_cpu(cpu)) std::perror("pin_to_cpu");
 
     itch::MappedFile file(argv[1]);
@@ -110,7 +126,8 @@ int run(int argc, char** argv) {
 
     // Pre-scan: find where the replay stops (--limit, the first message at or
     // after --to, or a framing error) and count the messages. Reading every
-    // block touches every page of the range, so the send loop never faults.
+    // block touches every page of the range, so the send loop normally does not
+    // fault (if the range stays in page cache).
     const unsigned char* const end = file.end();
     const unsigned char* stop = file.data();
     std::uint64_t total = 0;
@@ -138,7 +155,7 @@ int run(int argc, char** argv) {
     const double ns_per_msg = rate > 0 ? 1e9 / rate : 0;
     const double max_burst_ns = max_burst_us * 1e3;
     auto h_late = std::make_unique<stats::Histogram>();
-    std::uint64_t seq = 1, msgs = 0, packets = 0, bytes = 0, send_errors = 0, late_50us = 0, rebases = 0;
+    std::uint64_t seq = 1, msgs = 0, packets = 0, bytes = 0, send_errors = 0, late_50us = 0, rebases = 0, rate_limited = 0;
     bool anchored = false;
     std::uint64_t anchor_wall = 0, anchor_ts = 0;
     const std::uint64_t t_start = net::monotonic_ns();
@@ -148,15 +165,17 @@ int run(int argc, char** argv) {
         net::Span s = net::next_span(p, stop, max_payload, ~0ULL, ~0ULL);
         if (s.count == 0) break;  // cannot happen: the pre-scan checked the framing up to stop
         const bool paced = speed > 0 && s.first_ts >= from;
-        if (paced) s = net::next_span(p, stop, max_payload, 0, ~0ULL);
+        if (paced) s = net::next_span(p, stop, max_payload, batch_ns, ~0ULL);
 
         const std::uint64_t now0 = net::monotonic_ns();
         std::uint64_t due = now0;
         if (!paced && rate > 0) {
-            next_rate = std::max(next_rate, double(now0) - max_burst_ns);  // bounded catch-up
+            if (next_rate < double(now0) - max_burst_ns) {  // bounded catch-up
+                next_rate = double(now0) - max_burst_ns;
+                ++rate_limited;
+            }
             due = static_cast<std::uint64_t>(next_rate);
         }
-        std::uint64_t ts_due = 0;
         if (paced) {
             if (!anchored) {
                 anchored = true;
@@ -164,18 +183,17 @@ int run(int argc, char** argv) {
                 anchor_ts = s.first_ts;
             }
             const std::uint64_t dts = s.first_ts > anchor_ts ? s.first_ts - anchor_ts : 0;
-            ts_due = anchor_wall + static_cast<std::uint64_t>(double(dts) / speed);
-            due = ts_due;
+            due = anchor_wall + static_cast<std::uint64_t>(double(dts) / speed);
         }
         std::uint64_t now = now0;
         while (now < due) now = net::monotonic_ns();
         const std::uint64_t late = now - due;
         if (paced || speed == 0) {
             h_late->record(late);
-            if (late > 50'000) ++late_50us;
+            if (late >= 50'000) ++late_50us;
         }
-        if (paced && now - ts_due > 1'000'000) {  // far behind: move the schedule, keep later spacing
-            anchor_wall += now - ts_due;
+        if (paced && late > 1'000'000) {  // far behind: move the schedule, keep later spacing
+            anchor_wall += late;
             ++rebases;
         }
 
@@ -208,9 +226,10 @@ int run(int argc, char** argv) {
     std::printf("elapsed:           %.3f s   %.2f M msgs/s   %.0f k packets/s\n", secs, double(msgs) / secs / 1e6,
                 double(packets) / secs / 1e3);
     auto us = [](std::uint64_t ns) { return double(ns) / 1e3; };
-    std::printf("send lateness us (%s):  p50 %.2f  p99 %.2f  p99.9 %.2f  max %.2f   >50us %llu   re-bases %llu\n",
+    std::printf("send lateness us (%s):  p50 %.2f  p99 %.2f  p99.9 %.2f  max %.2f   >=50us %llu   re-bases %llu   rate-limited (behind --rate): %llu\n",
                 speed > 0 ? "paced" : "all", us(h_late->percentile(0.5)), us(h_late->percentile(0.99)), us(h_late->percentile(0.999)),
-                us(h_late->max()), (unsigned long long)late_50us, (unsigned long long)rebases);
+                us(h_late->max()), (unsigned long long)late_50us, (unsigned long long)rebases, (unsigned long long)rate_limited);
+    if (speed > 0) std::printf("batch window:      %llu ns\n", (unsigned long long)batch_ns);
     std::printf("next sequence:     %llu   send errors: %llu%s\n", (unsigned long long)seq,
                 (unsigned long long)send_errors, framing_error ? "   FRAMING ERROR in file" : "");
     return (send_errors == 0 && !framing_error) ? 0 : 1;
