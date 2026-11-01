@@ -13,6 +13,7 @@ $CXX "${COMMON[@]}" "${SANITIZE[@]}" tests/test_parser.cpp -o build/test_parser
 $CXX "${COMMON[@]}" "${RELEASE[@]}" tools/itch_stats.cpp -o build/itch_stats
 $CXX "${COMMON[@]}" "${SANITIZE[@]}" -Itests tests/test_book.cpp -o build/test_book
 $CXX "${COMMON[@]}" "${SANITIZE[@]}" -Itests tests/test_net.cpp -o build/test_net
+$CXX "${COMMON[@]}" "${SANITIZE[@]}" -Itests tests/test_udp.cpp -o build/test_udp
 $CXX "${COMMON[@]}" "${RELEASE[@]}" tools/itch_naive.cpp -o build/itch_naive
 $CXX "${COMMON[@]}" "${RELEASE[@]}" tools/itch_profile.cpp -o build/itch_profile
 $CXX "${COMMON[@]}" "${RELEASE[@]}" tools/book_replay.cpp -o build/book_replay
@@ -21,4 +22,5 @@ if [[ "${1:-}" == "test" ]]; then
     ./build/test_parser
     ./build/test_book
     ./build/test_net
+    ./build/test_udp
 fi
