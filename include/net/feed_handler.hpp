@@ -4,7 +4,9 @@
 // check the MoldUDP64 header, track sequence numbers, skip messages already
 // seen, and parse the new ones into any itch::parse handler (normally a
 // BookBuilder). A packet whose message blocks do not match its header's
-// count is counted as malformed.
+// count is counted as malformed. The parse is not bounded by the header's
+// count, so extra blocks in a lying packet are applied before the mismatch is
+// counted as malformed; the run fails either way.
 
 #include <cstddef>
 #include <cstdint>

@@ -155,7 +155,12 @@ public:
     [[nodiscard]] bool truncated(int i) const noexcept { return msgs_[i].msg_hdr.msg_flags & MSG_TRUNC; }
 
     // rx_ns: kernel receive time (CLOCK_REALTIME ns), 0 if absent.
-    // drops: the socket's cumulative drop count, -1 if absent.
+    // drops: the socket's cumulative drop count (SO_RXQ_OVFL), -1 if absent.
+    // The kernel attaches that cmsg only once the count is non-zero, so -1 is
+    // the normal "no drops yet" case. The count is a snapshot from when this
+    // datagram was queued: drops after the last delivered datagram are not
+    // visible. MoldUDP64 sequence gaps (including the end-of-session tail
+    // check) are the authoritative loss signal.
     void meta(int i, std::uint64_t& rx_ns, std::int64_t& drops) {
         rx_ns = 0;
         drops = -1;
