@@ -17,6 +17,7 @@ $CXX "${COMMON[@]}" "${SANITIZE[@]}" -Itests tests/test_udp.cpp -o build/test_ud
 $CXX "${COMMON[@]}" "${RELEASE[@]}" tools/itch_naive.cpp -o build/itch_naive
 $CXX "${COMMON[@]}" "${RELEASE[@]}" tools/itch_profile.cpp -o build/itch_profile
 $CXX "${COMMON[@]}" "${RELEASE[@]}" tools/book_replay.cpp -o build/book_replay
+$CXX "${COMMON[@]}" "${RELEASE[@]}" tools/feed_replayer.cpp -o build/feed_replayer
 
 if [[ "${1:-}" == "test" ]]; then
     ./build/test_parser
