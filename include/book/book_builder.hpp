@@ -70,12 +70,16 @@ struct Book {
 //   void on_execution(std::uint16_t locate, std::uint64_t ts, char resting_side,
 //                     std::uint32_t shares, std::uint32_t price);
 // on_book_update runs after the change; on_execution runs before the book
-// changes, with shares clamped to what the order had left. NullListener
-// compiles to nothing.
+// changes, with shares clamped to what the order had left. on_execution covers
+// printable executions against displayed orders; non-printable 'C' executions
+// (cross fills, reported again in 'Q') change the book but are not reported as
+// trades. NullListener compiles to nothing.
 struct NullListener {};
 
 template <template <bool> class Levels, class Listener = NullListener>
 class BookBuilder {
+    static constexpr bool kListening = !std::is_same_v<Listener, NullListener>;
+
 public:
     static constexpr std::size_t kMaxLocate = 65536;
 
@@ -105,36 +109,37 @@ public:
     void on(const itch::StockTradingAction& m) { books_[m.hdr.stock_locate].trading_state = m.trading_state; }
 
     void on(const itch::AddOrder& m) {
-        now_ = m.hdr.timestamp;
-        maybe_audit(now_);
+        set_now(m.hdr.timestamp);
+        maybe_audit(m.hdr.timestamp);
         add(m.hdr.stock_locate, m.order_ref, m.side, m.shares, m.price);
     }
     void on(const itch::AddOrderMpid& m) {
-        now_ = m.hdr.timestamp;
-        maybe_audit(now_);
+        set_now(m.hdr.timestamp);
+        maybe_audit(m.hdr.timestamp);
         add(m.hdr.stock_locate, m.order_ref, m.side, m.shares, m.price);
     }
     void on(const itch::OrderExecuted& m) {
-        now_ = m.hdr.timestamp;
+        set_now(m.hdr.timestamp);
         notify_execution(m.hdr.stock_locate, m.order_ref, m.executed_shares, 0);
         reduce(m.hdr.stock_locate, m.order_ref, m.executed_shares, false);
     }
     void on(const itch::OrderExecutedWithPrice& m) {
-        now_ = m.hdr.timestamp;
-        notify_execution(m.hdr.stock_locate, m.order_ref, m.executed_shares, m.execution_price);
+        set_now(m.hdr.timestamp);
+        if (m.printable == 'Y')
+            notify_execution(m.hdr.stock_locate, m.order_ref, m.executed_shares, m.execution_price);
         reduce(m.hdr.stock_locate, m.order_ref, m.executed_shares, false);
     }
     void on(const itch::OrderCancel& m) {
-        now_ = m.hdr.timestamp;
+        set_now(m.hdr.timestamp);
         reduce(m.hdr.stock_locate, m.order_ref, m.cancelled_shares, false);
     }
     void on(const itch::OrderDelete& m) {
-        now_ = m.hdr.timestamp;
+        set_now(m.hdr.timestamp);
         reduce(m.hdr.stock_locate, m.order_ref, 0, true);
     }
 
     void on(const itch::OrderReplace& m) {
-        now_ = m.hdr.timestamp;
+        set_now(m.hdr.timestamp);
         const std::uint16_t locate = m.hdr.stock_locate;
         Order* o = find(locate, m.original_order_ref);
         if (!o) return;
@@ -229,7 +234,9 @@ private:
         }
     }
 
-    static constexpr bool kListening = !std::is_same_v<Listener, NullListener>;
+    void set_now([[maybe_unused]] std::uint64_t ts) noexcept {
+        if constexpr (kListening) now_ = ts;
+    }
 
     // Tells the listener about an execution against a live displayed order,
     // before the book changes. price == 0 means "at the order's own price" ('E').
@@ -337,7 +344,7 @@ private:
     std::vector<ClosingCross> closing_crosses_;
     std::vector<Bbo> close_bbo_;
     std::vector<std::uint64_t> audit_times_;
-    Listener listener_;
+    [[no_unique_address]] Listener listener_;
     std::size_t next_audit_ = 0;
     std::vector<AuditResult> audits_;
     double audit_seconds_ = 0;
